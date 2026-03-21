@@ -56,7 +56,16 @@ static const PlaneStats PLANE_DEFS[3] = {
 };
 
 typedef struct { float x,y,z; float vx,vy,vz; float pitch,yaw,roll; float throttle; PlaneType type; } Plane;
-typedef struct { float x,y,z; bool alive; } EnemyPlane;
+typedef enum { DB_CIRCLE=0, DB_DIVE, DB_PULLUP, DB_DEAD } DiveBomberState;
+typedef struct {
+    float x,y,z;
+    float yaw, pitch, roll;
+    float speed;
+    DiveBomberState state;
+    float stateTimer;    // seconds in current state
+    float circleAngle;   // angle around player while circling
+    bool  alive;
+} DiveBomber;
 typedef struct {
     float x,y,z,pitch,yaw,roll,throttle;
     float walkerX,walkerY,walkerZ,walkerYaw;
@@ -84,7 +93,7 @@ ParkedPlane parkedPlanes[MAX_PARKED];
 int numParked = 0;
 
 Plane player;
-EnemyPlane enemies[MAX_ENEMIES];
+DiveBomber enemies[MAX_ENEMIES];
 RemotePlane remotePlayers[MAX_PLAYERS-1];
 
 Display *dpy;
@@ -174,18 +183,20 @@ RainDrop rain[MAX_RAIN];
 bool rainInited = false;
 
 // Explosions
-#define MAX_EXPLOSIONS 4
-#define EXPLOSION_LIFETIME 2.2f
-#define EXPLOSION_PARTICLES 48
+#define MAX_EXPLOSIONS 999
+#define EXPLOSION_LIFETIME 5.5f
+#define EXPLOSION_PARTICLES 20000
 typedef struct {
     float x, y, z;
     float timer;        // counts up from 0 to EXPLOSION_LIFETIME
     bool  active;
-    // Per-particle direction vectors (unit sphere) and speed
-    float px[EXPLOSION_PARTICLES];
-    float py[EXPLOSION_PARTICLES];
-    float pz[EXPLOSION_PARTICLES];
-    float ps[EXPLOSION_PARTICLES]; // speed scalar
+    float speedScale;
+    // Per-particle: direction, speed, type
+    float px[EXPLOSION_PARTICLES];  // x direction
+    float py[EXPLOSION_PARTICLES];  // y direction
+    float pz[EXPLOSION_PARTICLES];  // z direction
+    float ps[EXPLOSION_PARTICLES];  // speed scalar
+    int   pt[EXPLOSION_PARTICLES];  // type: 0=stem, 1=cap, 2=base ring
 } Explosion;
 static Explosion explosions[MAX_EXPLOSIONS];
 
@@ -206,20 +217,60 @@ static void queueExplosionBroadcast(float x, float y, float z, float scale){
     pthread_mutex_unlock(&explodeMutex);
 }
 
+static void initExplosionParticles(Explosion *e, float speedScale){
+    e->speedScale = speedScale;
+    // 0..34%  = stem (straight up, tight cone)
+    // 35..64% = cap  (upward then outward curl)
+    // 65..79% = base ring (radial outward, low)
+    // 80..99% = dust (very slow expanding ground cloud)
+    int stemCount = (int)(EXPLOSION_PARTICLES * 0.35f);
+    int capCount  = (int)(EXPLOSION_PARTICLES * 0.30f);
+    int ringCount = (int)(EXPLOSION_PARTICLES * 0.15f);
+    // remaining = dust
+    for(int p=0;p<EXPLOSION_PARTICLES;p++){
+        float th = ((float)rand()/RAND_MAX)*2.0f*(float)M_PI;
+        if(p < stemCount){
+            float spread = 0.18f;
+            float ph = ((float)rand()/RAND_MAX)*spread;
+            e->px[p] = sinf(ph)*cosf(th);
+            e->py[p] = cosf(ph);
+            e->pz[p] = sinf(ph)*sinf(th);
+            e->ps[p] = (3.0f + ((float)rand()/RAND_MAX)*3.0f) * speedScale;
+            e->pt[p] = 0;
+        } else if(p < stemCount+capCount){
+            float outward = 0.5f + ((float)rand()/RAND_MAX)*0.5f;
+            float upward  = 0.3f + ((float)rand()/RAND_MAX)*0.4f;
+            float mag = sqrtf(outward*outward + upward*upward);
+            e->px[p] = (outward/mag)*cosf(th);
+            e->py[p] =  upward/mag;
+            e->pz[p] = (outward/mag)*sinf(th);
+            e->ps[p] = (2.5f + ((float)rand()/RAND_MAX)*2.5f) * speedScale;
+            e->pt[p] = 1;
+        } else if(p < stemCount+capCount+ringCount){
+            float ph = ((float)rand()/RAND_MAX)*0.35f;
+            e->px[p] = cosf(ph)*cosf(th);
+            e->py[p] = sinf(ph)*0.3f;
+            e->pz[p] = cosf(ph)*sinf(th);
+            e->ps[p] = (3.0f + ((float)rand()/RAND_MAX)*4.0f) * speedScale;
+            e->pt[p] = 2;
+        } else {
+            // Dust: flat ring, very slow drift, large soft particles
+            e->px[p] = cosf(th);
+            e->py[p] = 0.02f + ((float)rand()/RAND_MAX)*0.06f; // barely lifts
+            e->pz[p] = sinf(th);
+            e->ps[p] = (0.5f + ((float)rand()/RAND_MAX)*1.5f) * speedScale;
+            e->pt[p] = 3;
+        }
+    }
+}
+
 static void triggerExplosionEx(float x, float y, float z, float speedScale){
     for(int i=0;i<MAX_EXPLOSIONS;i++){
         if(!explosions[i].active){
             explosions[i].x = x; explosions[i].y = y; explosions[i].z = z;
             explosions[i].timer = 0.0f;
             explosions[i].active = true;
-            for(int p=0;p<EXPLOSION_PARTICLES;p++){
-                float th = ((float)rand()/RAND_MAX)*2.0f*(float)M_PI;
-                float ph = ((float)rand()/RAND_MAX)*(float)M_PI;
-                explosions[i].px[p] = sinf(ph)*cosf(th);
-                explosions[i].py[p] = fabsf(cosf(ph));
-                explosions[i].pz[p] = sinf(ph)*sinf(th);
-                explosions[i].ps[p] = (3.0f + ((float)rand()/RAND_MAX)*5.0f) * speedScale;
-            }
+            initExplosionParticles(&explosions[i], speedScale);
             queueExplosionBroadcast(x, y, z, speedScale);
             return;
         }
@@ -234,14 +285,7 @@ static void receiveExplosion(float x, float y, float z, float speedScale){
             explosions[i].x = x; explosions[i].y = y; explosions[i].z = z;
             explosions[i].timer = 0.0f;
             explosions[i].active = true;
-            for(int p=0;p<EXPLOSION_PARTICLES;p++){
-                float th = ((float)rand()/RAND_MAX)*2.0f*(float)M_PI;
-                float ph = ((float)rand()/RAND_MAX)*(float)M_PI;
-                explosions[i].px[p] = sinf(ph)*cosf(th);
-                explosions[i].py[p] = fabsf(cosf(ph));
-                explosions[i].pz[p] = sinf(ph)*sinf(th);
-                explosions[i].ps[p] = (3.0f + ((float)rand()/RAND_MAX)*5.0f) * speedScale;
-            }
+            initExplosionParticles(&explosions[i], speedScale);
             return;
         }
     }
@@ -2158,27 +2202,78 @@ static void renderExplosions(){
         float cz = explosions[i].z;
 
         for(int p=0;p<EXPLOSION_PARTICLES;p++){
-            // Particle position: accelerates out then slows (ease-out)
-            float dist = explosions[i].ps[p] * (1.0f - (1.0f-t)*(1.0f-t)) * 12.0f;
-            float px = cx + explosions[i].px[p] * dist;
-            float py = cy + explosions[i].py[p] * dist;
-            float pz = cz + explosions[i].pz[p] * dist;
+            float spd  = explosions[i].ps[p];
+            int   type = explosions[i].pt[p];
+            float dirX = explosions[i].px[p];
+            float dirY = explosions[i].py[p];
+            float dirZ = explosions[i].pz[p];
 
-            // Size: grows then shrinks, scaled with particle speed
-            float szScale = 0.5f + explosions[i].ps[p] * 0.08f;
-            float sz = (0.4f + t * 1.2f) * (1.0f - t*0.6f) * szScale;
+            float px, py, pz, sz;
+            float r, g, b, a;
 
-            // Colour: white→orange→red→dark smoke
-            float r,g,b,a;
-            if(t < 0.15f){       // flash — white/yellow
-                float ft = t/0.15f;
-                r=1.0f; g=1.0f; b=1.0f-ft; a=1.0f;
-            } else if(t < 0.45f){ // orange fireball
-                float ft=(t-0.15f)/0.30f;
-                r=1.0f; g=0.6f-ft*0.4f; b=0.0f; a=1.0f-ft*0.3f;
-            } else {              // smoke — dark grey fading out
-                float ft=(t-0.45f)/0.55f;
-                r=0.25f-ft*0.2f; g=r; b=r; a=0.5f-ft*0.5f;
+            if(type == 0){
+                // ── Stem: rises quickly, smaller spread ──
+                float rise = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 6.0f;
+                px = cx + dirX * rise;
+                py = cy + dirY * rise;
+                pz = cz + dirZ * rise;
+                float szScale = 0.5f + spd * 0.05f + t * 1.2f;
+                sz = (0.4f + t*0.7f) * (1.0f - t*0.25f) * szScale;
+                if(t < 0.2f){
+                    float ft=t/0.2f; r=1.0f; g=0.9f-ft*0.5f; b=0.0f; a=1.0f;
+                } else if(t < 0.5f){
+                    float ft=(t-0.2f)/0.3f; r=0.9f-ft*0.6f; g=0.4f-ft*0.3f; b=0.0f; a=0.9f-ft*0.15f;
+                } else {
+                    float ft=(t-0.5f)/0.5f; r=0.22f-ft*0.18f; g=r*0.8f; b=r*0.7f; a=0.65f-ft*0.65f;
+                }
+
+            } else if(type == 1){
+                // ── Cap: arc up then curl outward, tighter radius ──
+                float rise   = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 5.0f;
+                float spread = (t > 0.2f) ? spd * ((t-0.2f)/0.8f) * ((t-0.2f)/0.8f) * 7.0f : 0.0f;
+                px = cx + dirX * (rise + spread);
+                py = cy + dirY * rise;
+                pz = cz + dirZ * (rise + spread);
+                float szScale = 0.7f + spd * 0.09f + t * 1.6f;
+                sz = (0.5f + t*0.9f) * (1.0f - t*0.35f) * szScale;
+                if(t < 0.25f){
+                    float ft=t/0.25f; r=1.0f; g=0.7f-ft*0.3f; b=0.0f; a=1.0f;
+                } else if(t < 0.55f){
+                    float ft=(t-0.25f)/0.3f; r=1.0f-ft*0.7f; g=0.4f-ft*0.35f; b=0.0f; a=0.95f-ft*0.15f;
+                } else {
+                    float ft=(t-0.55f)/0.45f; r=0.22f-ft*0.18f; g=r*0.85f; b=r*0.75f; a=0.72f-ft*0.72f;
+                }
+
+            } else if(type == 2){
+                // ── Base ring: low radial blast, tighter ──
+                float ring = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 6.0f;
+                px = cx + dirX * ring;
+                py = cy + dirY * ring * 0.3f;
+                pz = cz + dirZ * ring;
+                sz = (0.6f + t*0.4f) * (1.0f - t*0.8f) * (0.5f + spd*0.06f);
+                if(sz < 0.01f) sz = 0.01f;
+                if(t < 0.1f){
+                    float ft=t/0.1f; r=1.0f; g=1.0f; b=0.6f-ft*0.6f; a=1.0f;
+                } else if(t < 0.3f){
+                    float ft=(t-0.1f)/0.2f; r=1.0f-ft*0.4f; g=0.6f-ft*0.5f; b=0.0f; a=1.0f-ft*0.4f;
+                } else {
+                    float ft=(t-0.3f)/0.7f; r=0.25f-ft*0.25f; g=0.0f; b=0.0f; a=0.4f-ft*0.4f;
+                }
+
+            } else {
+                // ── Dust: slow expanding ground cloud, persists full lifetime ──
+                // Ease-in-out: accelerates then slows gently
+                float eased = t*t*(3.0f-2.0f*t);
+                float ring = spd * eased * 14.0f;
+                px = cx + dirX * ring;
+                py = cy + dirY * ring + 0.3f; // hugs ground
+                pz = cz + dirZ * ring;
+                // Large soft billow, grows over time
+                sz = (1.5f + t * 4.0f) * (0.4f + spd * 0.3f);
+                // Tan/brown dust colour fading out slowly
+                float fade = 1.0f - t*t;
+                r = 0.52f; g = 0.40f; b = 0.26f;
+                a = 0.28f * fade;
             }
 
             glColor4f(r,g,b,a);
@@ -2527,6 +2622,8 @@ static void renderMap(){
 #undef W2MY
 }
 
+static void renderDiveBombers();
+
 // -------- Render Scene --------
 void renderScene(){
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -2572,6 +2669,8 @@ void renderScene(){
         if(parkedPlanes[i].active)
             drawPlaneModel(parkedPlanes[i].wx, parkedPlanes[i].wy, parkedPlanes[i].wz,
                            0, parkedPlanes[i].heading, 0, 1.0f, parkedPlanes[i].type);
+
+    renderDiveBombers();
 
     // Player plane (always drawn — parked while on foot)
     if(!isPassenger)
@@ -2836,6 +2935,109 @@ void renderScene(){
     renderRain();
     renderFPS();
     // Swap is handled by the caller so menus can overlay before presenting
+}
+
+// -------- Divebombers --------
+static void updateDiveBombers(float dt){
+    for(int i=0;i<MAX_ENEMIES;i++){
+        if(!enemies[i].alive) continue;
+        DiveBomber *db = &enemies[i];
+
+        float dx = player.x - db->x;
+        float dy = player.y - db->y;
+        float dz = player.z - db->z;
+        float hdist = sqrtf(dx*dx + dz*dz);
+
+        switch(db->state){
+
+            case DB_CIRCLE: {
+                // Orbit player at ~120 units radius, ~65 units altitude
+                float targetY = terrainHeightAt(db->x, db->z) + 65.0f;
+                db->circleAngle += 0.35f * dt;
+                float tx = player.x + cosf(db->circleAngle) * 120.0f;
+                float tz = player.z + sinf(db->circleAngle) * 120.0f;
+                // Fly toward orbit point
+                float ox = tx - db->x, oz = tz - db->z;
+                float om = sqrtf(ox*ox + oz*oz);
+                db->yaw = atan2f(ox, oz);
+                if(om > 0.1f){ db->x += (ox/om)*db->speed*dt; db->z += (oz/om)*db->speed*dt; }
+                db->y += (targetY - db->y) * 2.0f * dt;
+                db->pitch = 0.0f;
+                db->roll  = 0.25f;
+
+                db->stateTimer -= dt;
+                if(db->stateTimer <= 0.0f && hdist < 200.0f){
+                    db->state = DB_DIVE;
+                    db->stateTimer = 0.0f;
+                    db->speed = 20.0f;
+                }
+                break;
+            }
+
+            case DB_DIVE: {
+                // Nose toward player position on ground
+                float tx = player.x, ty = terrainHeightAt(player.x,player.z)+2.0f, tz = player.z;
+                float ddx = tx-db->x, ddy = ty-db->y, ddz = tz-db->z;
+                float ddm = sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
+                if(ddm > 0.1f){
+                    db->yaw   = atan2f(ddx, ddz);
+                    db->pitch = -asinf(clampf(ddy/ddm, -1.0f, 1.0f)) * 0.6f; // nose-down
+                    db->x += (ddx/ddm)*db->speed*dt;
+                    db->y += (ddy/ddm)*db->speed*dt;
+                    db->z += (ddz/ddm)*db->speed*dt;
+                }
+                db->roll = sinf(db->stateTimer*3.0f)*0.3f; // slight banking wobble
+                db->speed = clampf(db->speed + 8.0f*dt, 0.0f, 28.0f); // accelerate in dive
+                db->stateTimer += dt;
+
+                float groundY = terrainHeightAt(db->x, db->z);
+                // Drop bomb when low and close
+                if(db->y < groundY + 18.0f || db->stateTimer > 6.0f){
+                    // Bomb explodes at player position (area bomb)
+                    triggerExplosionEx(player.x, terrainHeightAt(player.x,player.z)+1.0f, player.z, 2.5f);
+                    triggerExplosionEx(player.x+3.0f, terrainHeightAt(player.x,player.z)+0.5f, player.z-2.0f, 1.8f);
+                    db->state = DB_PULLUP;
+                    db->stateTimer = 0.0f;
+                    db->speed = 18.0f;
+                }
+                break;
+            }
+
+            case DB_PULLUP: {
+                // Hard climb away
+                float targetY = terrainHeightAt(db->x,db->z) + 70.0f;
+                db->pitch = clampf(db->pitch + 1.8f*dt, -1.2f, 0.5f);
+                db->x += sinf(db->yaw)*cosf(db->pitch)*db->speed*dt;
+                db->y += sinf(db->pitch)*db->speed*dt + 10.0f*dt;
+                db->z += cosf(db->yaw)*cosf(db->pitch)*db->speed*dt;
+                db->roll *= 0.9f;
+                db->stateTimer += dt;
+                // Once high enough, go back to circling
+                if(db->y >= targetY - 5.0f || db->stateTimer > 5.0f){
+                    db->state = DB_CIRCLE;
+                    db->stateTimer = 3.0f + ((float)rand()/RAND_MAX)*4.0f;
+                    db->pitch = 0.0f;
+                    db->speed = 12.0f;
+                }
+                break;
+            }
+
+            case DB_DEAD:
+            default: break;
+        }
+
+        // Clamp above terrain
+        float gnd = terrainHeightAt(db->x, db->z);
+        if(db->y < gnd + 1.0f){ db->y = gnd + 1.0f; }
+    }
+}
+
+static void renderDiveBombers(){
+    for(int i=0;i<MAX_ENEMIES;i++){
+        if(!enemies[i].alive) continue;
+        DiveBomber *db = &enemies[i];
+        drawPlaneModel(db->x, db->y, db->z, db->pitch, db->yaw, db->roll, 0.0f, PLANE_FIGHTER);
+    }
 }
 
 // -------- Physics --------
@@ -3511,6 +3713,7 @@ void gameLoop(){
         updateWeather(DT);
         updateTornados(DT);
         updateExplosions(DT);
+        updateDiveBombers(DT);
         updatePhysics(DT);
         renderScene();
         glXSwapBuffers(dpy,win);
@@ -3608,7 +3811,18 @@ void startGame(){
     player.x=0; player.y=airports[0].groundY+1.0f; player.z=0;
     player.pitch=0; player.yaw=0; player.roll=0; player.throttle=0.0f; player.type=PLANE_FIGHTER;
     onGround=true; airspeed=0.0f;
-    for(int i=0;i<MAX_ENEMIES;i++){ enemies[i].x=(rand()%20-10); enemies[i].y=5; enemies[i].z=(rand()%20-10); enemies[i].alive=true; }
+    for(int i=0;i<MAX_ENEMIES;i++){
+        enemies[i].circleAngle = ((float)i/MAX_ENEMIES)*2.0f*(float)M_PI;
+        enemies[i].x     = player.x + cosf(enemies[i].circleAngle)*120.0f;
+        enemies[i].y     = player.y + 60.0f;
+        enemies[i].z     = player.z + sinf(enemies[i].circleAngle)*120.0f;
+        enemies[i].yaw   = enemies[i].circleAngle + (float)M_PI*0.5f;
+        enemies[i].pitch = 0.0f; enemies[i].roll = 0.2f;
+        enemies[i].speed = 12.0f;
+        enemies[i].state = DB_CIRCLE;
+        enemies[i].stateTimer = 2.0f + ((float)rand()/RAND_MAX)*4.0f;
+        enemies[i].alive = true;
+    }
 
     initWeather();
     initNetwork(joinIP, 5000, 5001);
