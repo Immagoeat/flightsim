@@ -5,6 +5,7 @@
 #include <GL/glx.h>
 #include <GL/glu.h>
 #include <GL/glut.h>
+#include <GL/glext.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -20,6 +21,8 @@
 #include <sys/select.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265f
@@ -27,7 +30,6 @@
 #define WIDTH 1024
 #define HEIGHT 768
 #define DT 0.016f
-#define MAX_ENEMIES 2
 #define MAX_PLAYERS 2
 #define TEX_SIZE 64
 #define MSG_PLAYER_DATA  0
@@ -35,13 +37,15 @@
 #define MSG_TERRAIN_SEED 2
 #define MSG_TORNADO      3
 #define MSG_EXPLOSION    4
+#define MSG_CHAT         5
+#define MSG_VOICE        6
 // Turbulence is now dynamic — see turbulenceLevel global
 #define TURBULENCE_MAX 0.004f   // peak per-frame angular kick (was 0.01)
 #define GRAVITY 9.8f
 #define TERRAIN_SIZE 256       // grid cells per side (must be power-of-2)
-#define TERRAIN_SCALE 2.0f     // world units per cell => 512x512 world
-#define TERRAIN_HEIGHT 22.0f   // max terrain height
-#define MAX_AIRPORTS 5
+#define TERRAIN_SCALE 4.0f     // world units per cell => 1024x1024 world
+#define TERRAIN_HEIGHT 40.0f   // max terrain height
+#define MAX_AIRPORTS 12
 
 typedef enum { PLANE_FIGHTER=0, PLANE_PROP=1, PLANE_AIRLINER=2 } PlaneType;
 typedef struct {
@@ -56,16 +60,6 @@ static const PlaneStats PLANE_DEFS[3] = {
 };
 
 typedef struct { float x,y,z; float vx,vy,vz; float pitch,yaw,roll; float throttle; PlaneType type; } Plane;
-typedef enum { DB_CIRCLE=0, DB_DIVE, DB_PULLUP, DB_DEAD } DiveBomberState;
-typedef struct {
-    float x,y,z;
-    float yaw, pitch, roll;
-    float speed;
-    DiveBomberState state;
-    float stateTimer;    // seconds in current state
-    float circleAngle;   // angle around player while circling
-    bool  alive;
-} DiveBomber;
 typedef struct {
     float x,y,z,pitch,yaw,roll,throttle;
     float walkerX,walkerY,walkerZ,walkerYaw;
@@ -92,8 +86,39 @@ typedef struct { float wx,wy,wz, heading; bool active; PlaneType type; } ParkedP
 ParkedPlane parkedPlanes[MAX_PARKED];
 int numParked = 0;
 
+// NPCs
+#define MAX_NPCS 32
+typedef enum {
+    NPC_WALK=0,   // wandering airport apron on foot
+    NPC_BOARD,    // walking toward a plane to board
+    NPC_TAKEOFF,  // rolling down runway, climbing out
+    NPC_FLY,      // flying a circuit
+    NPC_APPROACH, // descending to land
+    NPC_LAND,     // on runway rolling to stop
+    NPC_DEPLANE   // walking away from plane after landing
+} NpcState;
+typedef struct {
+    float x,y,z,yaw;          // on-foot position/heading
+    float px,py,pz;            // plane position when flying
+    float ppitch,pyaw,proll;   // plane orientation when flying
+    float pspeed;              // plane airspeed when flying
+    float pthrottle;
+    PlaneType ptype;
+    NpcState  state;
+    float     stateTimer;      // countdown for current state
+    float     wanderTimer;     // time until next wander direction
+    float     wanderYaw;       // current wander heading
+    int       airportIdx;      // home airport index
+    float     homeX,homeZ;     // apron spawn position
+    bool      alive;
+    // circuit waypoint when flying
+    float     wpX,wpZ,wpAlt;
+    int       wpIdx;
+} Npc;
+Npc npcs[MAX_NPCS];
+int numNpcs = 0;
+
 Plane player;
-DiveBomber enemies[MAX_ENEMIES];
 RemotePlane remotePlayers[MAX_PLAYERS-1];
 
 Display *dpy;
@@ -102,6 +127,9 @@ GLXContext glc;
 bool running=true;
 bool keys[65536];
 GLuint groundTexture;
+// Per-biome detail textures: 0=water 1=sand 2=grass 3=rock 4=snow
+#define NUM_BIOME_TEX 5
+static GLuint biomeTex[NUM_BIOME_TEX];
 
 // Landing gear
 float gearExtension = 1.0f;   // 0.0 = fully retracted, 1.0 = fully deployed
@@ -129,6 +157,12 @@ float walkerYaw    = 0.0f;
 bool  enterKeyHeld = false;
 #define WALKER_SPEED   5.5f
 #define ENTER_DIST     6.0f   // max distance to enter a plane
+// Time of day (0=midnight, 0.25=dawn, 0.5=noon, 0.75=dusk, 1=midnight)
+static float gameTime = 0.35f;   // start near dawn
+static float gameTimeSpeed = 0.0015f; // 1 real second = ~5 sim minutes
+// Cockpit view
+static bool cockpitView = false;
+static bool cockpitKeyHeld = false;
 #define WALKER_EYE_H   1.7f   // eye height above ground
 
 // Map
@@ -142,7 +176,7 @@ float turbulenceTarget = 0.3f;  // drifts toward this
 float turbulenceTimer  = 0.0f;  // time until next target change
 
 // ---- Menu ----
-typedef enum { MENU_MAIN, MENU_SETTINGS, MENU_JOIN, MENU_PLAYING } MenuState;
+typedef enum { MENU_MAIN, MENU_SETTINGS, MENU_JOIN, MENU_PLAYING, MENU_DEAD } MenuState;
 MenuState menuState = MENU_MAIN;
 bool gameStarted = false;
 
@@ -162,6 +196,122 @@ bool  joinIPFocus = false;
 bool  joinFailed  = false;   // true when connect attempt timed out
 float joinTimer   = 0.0f;    // seconds since connect was clicked
 #define JOIN_TIMEOUT 5.0f    // seconds before showing "no server found"
+
+// ---- Text Chat ----
+#define CHAT_MAX_MSGS   20
+#define CHAT_MSG_LEN    80
+#define CHAT_FADE_TIME  8.0f   // seconds before message fades
+typedef struct {
+    char   text[CHAT_MSG_LEN];
+    float  timer;   // countdown to fade
+} ChatMsg;
+static ChatMsg  chatLog[CHAT_MAX_MSGS];
+static int      chatCount    = 0;
+static bool     chatOpen     = false;
+static char     chatInput[CHAT_MSG_LEN] = {0};
+static int      chatInputLen = 0;
+static bool     chatKeyHeld  = false;
+
+static void chatAddMsg(const char *txt){
+    if(chatCount >= CHAT_MAX_MSGS){
+        memmove(&chatLog[0], &chatLog[1], sizeof(ChatMsg)*(CHAT_MAX_MSGS-1));
+        chatCount = CHAT_MAX_MSGS-1;
+    }
+    strncpy(chatLog[chatCount].text, txt, CHAT_MSG_LEN-1);
+    chatLog[chatCount].text[CHAT_MSG_LEN-1]='\0';
+    chatLog[chatCount].timer = CHAT_FADE_TIME;
+    chatCount++;
+}
+
+// chatSend is defined later (after network globals) — see chatSendImpl
+static char chatPendingMsg[CHAT_MSG_LEN] = {0};
+static bool chatHasPending = false;
+static void chatSend(const char *msg){
+    char full[CHAT_MSG_LEN+8];
+    snprintf(full, sizeof(full), "[me] %s", msg);
+    chatAddMsg(full);
+    strncpy(chatPendingMsg, msg, CHAT_MSG_LEN-1);
+    chatHasPending = true;  // flushed in game loop
+}
+
+// ---- Proximity Voice Chat — globals only here; functions defined after AL types ----
+#define VOICE_SAMPLE_RATE   16000
+#define VOICE_FRAME_MS      20
+#define VOICE_FRAME_SAMPLES (VOICE_SAMPLE_RATE * VOICE_FRAME_MS / 1000)
+#define VOICE_MAX_BYTES     512
+#define VOICE_PROX_DIST     200.0f
+#define OPUS_APPLICATION_VOIP 2048
+#define OPUS_OK 0
+#define SND_PCM_FORMAT_S16_LE  2
+#define SND_PCM_ACCESS_RW_INTERLEAVED 3
+
+typedef struct OpusEncoder OpusEncoder;
+typedef struct OpusDecoder OpusDecoder;
+typedef void*         snd_pcm_t;
+typedef unsigned long snd_pcm_uframes_t;
+
+static void *opusLib = NULL;
+static OpusEncoder* (*opus_encoder_create)(int,int,int,int*) = NULL;
+static int (*opus_encode)(OpusEncoder*,const short*,int,unsigned char*,int) = NULL;
+static OpusDecoder* (*opus_decoder_create)(int,int,int*) = NULL;
+static int (*opus_decode)(OpusDecoder*,const unsigned char*,int,short*,int,int) = NULL;
+static void *alsaLib = NULL;
+static int  (*alsa_pcm_open)(snd_pcm_t**,const char*,int,int) = NULL;
+static int  (*alsa_pcm_set_params)(snd_pcm_t*,int,int,unsigned int,unsigned int,int,unsigned int) = NULL;
+static long (*alsa_pcm_readi)(snd_pcm_t*,void*,snd_pcm_uframes_t) = NULL;
+static int  (*alsa_pcm_close)(snd_pcm_t*) = NULL;
+static int  (*alsa_pcm_recover)(snd_pcm_t*,int,int) = NULL;
+
+static bool       voiceReady      = false;
+static OpusEncoder *voiceEnc      = NULL;
+static OpusDecoder *voiceDec      = NULL;
+static snd_pcm_t  *voicePcm       = NULL;
+static pthread_t   voiceCapThread;
+static bool        voiceCapRunning = false;
+static bool        voiceTx         = false;
+static unsigned int voiceSource    = 0;
+static unsigned int voiceBuffers[8];
+static int         voiceBufHead    = 0;
+#define VOICE_HDR (sizeof(int)+sizeof(float)*3+sizeof(int))
+
+// ---- Trees ----
+#define MAX_TREES 3000
+typedef struct {
+    float x, y, z;
+    float h;          // height
+    float r;          // canopy radius
+    int   variant;    // 0=pine, 1=oak, 2=palm (biome-dependent)
+} Tree;
+static Tree  trees[MAX_TREES];
+static int   numTrees = 0;
+
+// ---- Clouds ----
+#define MAX_CLOUDS 80
+typedef struct {
+    float x, y, z;          // world position
+    float r;                 // puff radius
+    float brightness;        // 0.7..1.0
+} Cloud;
+static Cloud clouds[MAX_CLOUDS];
+static int   numClouds = 0;
+
+// ---- LAN Server Discovery ----
+#define LAN_DISCOVERY_PORT 5002
+#define LAN_ANNOUNCE_INTERVAL 2.0f
+#define LAN_SERVER_TIMEOUT    6.0f
+#define MAX_LAN_SERVERS 8
+typedef struct {
+    char ip[64];
+    float seenTimer;    // counts down; remove when <= 0
+} LanServer;
+static LanServer lanServers[MAX_LAN_SERVERS];
+static int       numLanServers = 0;
+static float     lanAnnounceTimer = 0.0f;
+static int       lanSock = -1;          // UDP socket for discovery
+static pthread_t lanThread;
+static pthread_mutex_t lanMutex = PTHREAD_MUTEX_INITIALIZER;
+static bool      lanThreadRunning = false;
+static int       selectedServer = -1;   // index into lanServers for Join UI
 
 // ---- Weather ----
 typedef enum { WX_CLEAR=0, WX_CLOUDY, WX_OVERCAST, WX_STORM } WeatherType;
@@ -183,9 +333,9 @@ RainDrop rain[MAX_RAIN];
 bool rainInited = false;
 
 // Explosions
-#define MAX_EXPLOSIONS 999
-#define EXPLOSION_LIFETIME 5.5f
-#define EXPLOSION_PARTICLES 20000
+#define MAX_EXPLOSIONS 8
+#define EXPLOSION_LIFETIME 0.5f
+#define EXPLOSION_PARTICLES 2000
 typedef struct {
     float x, y, z;
     float timer;        // counts up from 0 to EXPLOSION_LIFETIME
@@ -207,6 +357,332 @@ static ExplodeQueueEntry explodeQueue[MAX_EXPLODE_QUEUE];
 static int explodeQueueHead = 0, explodeQueueTail = 0;
 static pthread_mutex_t explodeMutex = PTHREAD_MUTEX_INITIALIZER;
 
+// ---- Missiles ----
+#define MAX_MISSILES 8
+#define MISSILE_SPEED   220.0f   // world units/s
+#define MISSILE_RANGE   600.0f   // max travel distance before self-destruct
+#define MISSILE_HIT_R   5.0f    // hit-sphere radius against NPC planes
+typedef struct {
+    float x,y,z;          // current position
+    float vx,vy,vz;       // velocity (normalised dir * MISSILE_SPEED)
+    float dist;           // distance travelled so far
+    bool  active;
+} Missile;
+static Missile missiles[MAX_MISSILES];
+static float missileCooldown = 0.0f;   // seconds until next shot allowed
+static bool  missileKeyHeld  = false;
+#define MISSILE_COOLDOWN 0.6f
+
+// ============================================================
+// Sound — OpenAL via dlopen (no compile-time dep)
+// ============================================================
+#include <dlfcn.h>
+#include <stdint.h>
+
+#define AL_FORMAT_MONO16    0x1101
+#define AL_BUFFER           0x1009
+#define AL_SOURCE_STATE     0x1010
+#define AL_PLAYING          0x1012
+#define AL_LOOPING          0x1007
+#define AL_GAIN             0x100A
+#define AL_PITCH            0x1003
+#define AL_TRUE             1
+#define AL_FALSE            0
+#define ALC_DEFAULT_DEVICE_SPECIFIER 0x1004
+
+typedef unsigned int ALuint;
+typedef int          ALint;
+typedef float        ALfloat;
+typedef unsigned int ALenum;
+typedef void*        ALCdevice;
+typedef void*        ALCcontext;
+typedef int          ALCboolean;
+
+// Minimal function pointer set
+static ALCdevice* (*palcOpenDevice)(const char*)        = NULL;
+static ALCcontext*(*palcCreateContext)(ALCdevice*,const int*) = NULL;
+static ALCboolean (*palcMakeContextCurrent)(ALCcontext*) = NULL;
+static void       (*palGenBuffers)(ALint,ALuint*)        = NULL;
+static void       (*palGenSources)(ALint,ALuint*)        = NULL;
+static void       (*palBufferData)(ALuint,ALenum,const void*,ALint,ALint) = NULL;
+static void       (*palSourcei)(ALuint,ALenum,ALint)     = NULL;
+static void       (*palSourcef)(ALuint,ALenum,ALfloat)   = NULL;
+static void       (*palSourcePlay)(ALuint)               = NULL;
+static void       (*palSourceStop)(ALuint)               = NULL;
+static void       (*palGetSourcei)(ALuint,ALenum,ALint*) = NULL;
+
+static bool alAvailable = false;
+
+// Sound IDs
+typedef enum {
+    SND_EXPLOSION=0,
+    SND_MISSILE,
+    SND_LAND,
+    SND_GEAR,
+    SND_COUNT
+} SoundId;
+
+static ALuint alBufs[SND_COUNT];
+static ALuint alSrcs[SND_COUNT];
+static ALuint alEngSrc;    // engine: looping source
+static ALuint alEngBuf;    // engine: buffer (rebuilt when pitch changes)
+
+#define SND_RATE 22050
+
+static short *sndAlloc(int n){ return (short*)malloc(n*sizeof(short)); }
+
+static short *synthBuf(int frames, float freq, float vol, bool noise_only){
+    short *b = sndAlloc(frames);
+    float phase = 0.0f, dp = 2.0f*(float)M_PI*freq/SND_RATE;
+    for(int i=0;i<frames;i++){
+        float s = 0.0f;
+        if(!noise_only){
+            s  = sinf(phase)*0.50f + sinf(phase*2)*0.25f
+               + sinf(phase*3)*0.12f + sinf(phase*4)*0.08f;
+        }
+        s += ((rand()%1000)/500.0f - 1.0f) * (noise_only ? 0.8f : 0.04f);
+        b[i] = (short)(s * vol * 10000.0f);
+        phase += dp; if(phase>6.28318f) phase-=6.28318f;
+    }
+    return b;
+}
+
+static void alLoadBuf(ALuint buf, short *data, int frames){
+    palBufferData(buf, AL_FORMAT_MONO16, data, frames*2, SND_RATE);
+    free(data);
+}
+
+static void sndBuildEngine(float throttle){
+    float freq = 55.0f + throttle * 180.0f;
+    float vol  = 0.40f + throttle * 0.45f;
+    int frames = SND_RATE / 2;   // 0.5s loop
+    short *b = synthBuf(frames, freq, vol, false);
+    // fade loop endpoints to avoid click
+    int fade = SND_RATE/100;
+    for(int i=0;i<fade;i++){
+        float t=(float)i/fade;
+        b[i]=(short)(b[i]*t);
+        b[frames-1-i]=(short)(b[frames-1-i]*t);
+    }
+    palSourceStop(alEngSrc);
+    palBufferData(alEngBuf, AL_FORMAT_MONO16, b, frames*2, SND_RATE);
+    free(b);
+    palSourcei(alEngSrc, AL_BUFFER, (ALint)alEngBuf);
+    palSourcei(alEngSrc, AL_LOOPING, AL_TRUE);
+    palSourcef(alEngSrc, AL_GAIN, 0.7f);
+}
+
+static void sndInit(){
+    void *lib = dlopen("libopenal.so.1", RTLD_LAZY);
+    if(!lib){ fprintf(stderr,"[snd] OpenAL not found, no audio\n"); return; }
+#define LOAD(sym,name) sym = dlsym(lib,name); if(!sym){ fprintf(stderr,"[snd] missing %s\n",name); return; }
+    LOAD(palcOpenDevice,       "alcOpenDevice")
+    LOAD(palcCreateContext,    "alcCreateContext")
+    LOAD(palcMakeContextCurrent,"alcMakeContextCurrent")
+    LOAD(palGenBuffers,        "alGenBuffers")
+    LOAD(palGenSources,        "alGenSources")
+    LOAD(palBufferData,        "alBufferData")
+    LOAD(palSourcei,           "alSourcei")
+    LOAD(palSourcef,           "alSourcef")
+    LOAD(palSourcePlay,        "alSourcePlay")
+    LOAD(palSourceStop,        "alSourceStop")
+    LOAD(palGetSourcei,        "alGetSourcei")
+#undef LOAD
+    ALCdevice  *dev = palcOpenDevice(NULL);
+    if(!dev){ fprintf(stderr,"[snd] alcOpenDevice failed\n"); return; }
+    ALCcontext *ctx = palcCreateContext(dev, NULL);
+    palcMakeContextCurrent(ctx);
+
+    palGenBuffers(SND_COUNT, alBufs);
+    palGenSources(SND_COUNT, alSrcs);
+    palGenBuffers(1, &alEngBuf);
+    palGenSources(1, &alEngSrc);
+
+    // Explosion: 1.2s noise + 40Hz rumble with decay
+    {
+        int frames = (int)(SND_RATE*1.2f);
+        short *b = sndAlloc(frames);
+        for(int i=0;i<frames;i++){
+            float t=i/(float)SND_RATE, env=expf(-t*4.0f);
+            float s=((rand()%32767)/16383.5f-1.0f) + sinf(2.f*(float)M_PI*40.f*t)*0.5f;
+            b[i]=(short)(s*env*28000.0f);
+        }
+        alLoadBuf(alBufs[SND_EXPLOSION], b, frames);
+    }
+    // Missile: 0.4s rising hiss
+    {
+        int frames = (int)(SND_RATE*0.4f);
+        short *b = sndAlloc(frames);
+        for(int i=0;i<frames;i++){
+            float t=i/(float)SND_RATE, env=t/0.4f;
+            float s=((rand()%32767)/16383.5f-1.0f)*0.6f
+                   +sinf(2.f*(float)M_PI*(400.f+1200.f*env)*t)*0.3f;
+            b[i]=(short)(s*env*22000.0f);
+        }
+        alLoadBuf(alBufs[SND_MISSILE], b, frames);
+    }
+    // Landing thud: 0.3s
+    {
+        int frames = (int)(SND_RATE*0.3f);
+        short *b = sndAlloc(frames);
+        for(int i=0;i<frames;i++){
+            float t=i/(float)SND_RATE, env=expf(-t*12.0f);
+            b[i]=(short)(sinf(2.f*(float)M_PI*80.f*t)*env*28000.0f);
+        }
+        alLoadBuf(alBufs[SND_LAND], b, frames);
+    }
+    // Gear clunk: 0.2s
+    {
+        int frames = (int)(SND_RATE*0.2f);
+        short *b = sndAlloc(frames);
+        for(int i=0;i<frames;i++){
+            float t=i/(float)SND_RATE, env=expf(-t*20.0f);
+            float s=sinf(2.f*(float)M_PI*320.f*t)+((rand()%1000)/500.0f-1.0f)*0.3f;
+            b[i]=(short)(s*env*18000.0f);
+        }
+        alLoadBuf(alBufs[SND_GEAR], b, frames);
+    }
+
+    for(int i=0;i<SND_COUNT;i++){
+        palSourcei(alSrcs[i], AL_BUFFER, (ALint)alBufs[i]);
+        palSourcef(alSrcs[i], AL_GAIN, 1.0f);
+    }
+
+    sndBuildEngine(0.0f);
+    alAvailable = true;
+}
+
+static void sndPlay(SoundId id){
+    if(!alAvailable) return;
+    ALint state; palGetSourcei(alSrcs[id], AL_SOURCE_STATE, &state);
+    if(state == AL_PLAYING) palSourceStop(alSrcs[id]);
+    palSourcePlay(alSrcs[id]);
+}
+
+static float sndLastThrottle = -1.0f;
+static void sndUpdateEngine(float throttle, bool running){
+    if(!alAvailable) return;
+    if(!running){ palSourceStop(alEngSrc); sndLastThrottle=-1.0f; return; }
+    // Rebuild buffer only when throttle changes by >2%
+    if(fabsf(throttle - sndLastThrottle) > 0.02f){
+        sndBuildEngine(throttle);
+        sndLastThrottle = throttle;
+    }
+    ALint state; palGetSourcei(alEngSrc, AL_SOURCE_STATE, &state);
+    if(state != AL_PLAYING) palSourcePlay(alEngSrc);
+}
+// ---- Proximity Voice Chat — implementation (after AL types) ----
+static bool voiceInit(){
+    opusLib = dlopen("libopus.so.0", RTLD_LAZY);
+    if(!opusLib) opusLib = dlopen("libopus.so", RTLD_LAZY);
+    if(!opusLib){ fprintf(stderr,"[VOICE] libopus not found — voice disabled\n"); return false; }
+    opus_encoder_create = dlsym(opusLib,"opus_encoder_create");
+    opus_encode         = dlsym(opusLib,"opus_encode");
+    opus_decoder_create = dlsym(opusLib,"opus_decoder_create");
+    opus_decode         = dlsym(opusLib,"opus_decode");
+    if(!opus_encoder_create||!opus_encode||!opus_decoder_create||!opus_decode){
+        fprintf(stderr,"[VOICE] Opus symbols missing\n"); return false; }
+
+    alsaLib = dlopen("libasound.so.2", RTLD_LAZY);
+    if(!alsaLib){ fprintf(stderr,"[VOICE] libasound not found — voice disabled\n"); return false; }
+    alsa_pcm_open       = dlsym(alsaLib,"snd_pcm_open");
+    alsa_pcm_set_params = dlsym(alsaLib,"snd_pcm_set_params");
+    alsa_pcm_readi      = dlsym(alsaLib,"snd_pcm_readi");
+    alsa_pcm_close      = dlsym(alsaLib,"snd_pcm_close");
+    alsa_pcm_recover    = dlsym(alsaLib,"snd_pcm_recover");
+
+    int err;
+    voiceEnc = opus_encoder_create(VOICE_SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &err);
+    if(err != OPUS_OK){ fprintf(stderr,"[VOICE] Encoder init failed\n"); return false; }
+    voiceDec = opus_decoder_create(VOICE_SAMPLE_RATE, 1, &err);
+    if(err != OPUS_OK){ fprintf(stderr,"[VOICE] Decoder init failed\n"); return false; }
+
+    if(alsa_pcm_open(&voicePcm, "default", 1, 0) < 0){
+        fprintf(stderr,"[VOICE] ALSA capture open failed\n"); return false; }
+    if(alsa_pcm_set_params(voicePcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+                           1, VOICE_SAMPLE_RATE, 1, VOICE_FRAME_MS*1000) < 0){
+        fprintf(stderr,"[VOICE] ALSA set_params failed\n"); return false; }
+
+    if(palGenSources){ palGenSources(1, (ALuint*)&voiceSource); }
+    if(palGenBuffers){ palGenBuffers(8, (ALuint*)voiceBuffers); }
+
+    voiceReady = true;
+    fprintf(stderr,"[VOICE] Ready — hold V to transmit (Opus %d Hz)\n", VOICE_SAMPLE_RATE);
+    return true;
+}
+
+static void voiceReceive(const char *buf, int n){
+    if(!voiceReady || n < (int)VOICE_HDR) return;
+    const char *p = buf + sizeof(int);
+    float rx2 = ((float*)p)[0], ry2 = ((float*)p)[1], rz2 = ((float*)p)[2];
+    p += sizeof(float)*3;
+    int payLen; memcpy(&payLen, p, sizeof(int)); p += sizeof(int);
+    if(payLen <= 0 || payLen > VOICE_MAX_BYTES || n < (int)(VOICE_HDR+payLen)) return;
+
+    float myX = inPlane ? player.x : walkerX;
+    float myY = inPlane ? player.y : walkerY;
+    float myZ = inPlane ? player.z : walkerZ;
+    float dx2=rx2-myX, dy2=ry2-myY, dz2=rz2-myZ;
+    float dist = sqrtf(dx2*dx2+dy2*dy2+dz2*dz2);
+    if(dist > VOICE_PROX_DIST) return;
+    float gain = 1.0f - dist/VOICE_PROX_DIST;
+
+    short pcmOut[VOICE_FRAME_SAMPLES];
+    int frames = opus_decode(voiceDec, (const unsigned char*)p, payLen,
+                             pcmOut, VOICE_FRAME_SAMPLES, 0);
+    if(frames <= 0) return;
+
+    if(!palBufferData || !palGenSources || !voiceSource) return;
+    ALuint vbuf = (ALuint)voiceBuffers[voiceBufHead % 8];
+    voiceBufHead++;
+    palBufferData(vbuf, AL_FORMAT_MONO16, pcmOut, frames*2, VOICE_SAMPLE_RATE);
+    void (*pSourceQueueBuffers)(ALuint,ALint,const ALuint*) =
+        dlsym(RTLD_DEFAULT,"alSourceQueueBuffers");
+    if(pSourceQueueBuffers) pSourceQueueBuffers((ALuint)voiceSource, 1, &vbuf);
+    if(palSourcef)  palSourcef((ALuint)voiceSource, AL_GAIN, gain*0.9f);
+    if(palSourcePlay) palSourcePlay((ALuint)voiceSource);
+}
+
+static void* voiceCapThreadFunc(void *arg){
+    (void)arg;
+    // These are defined later in the TU — access via extern
+    extern int sockfd;
+    extern struct sockaddr_in otherAddr;
+    extern bool isServer, clientConnected, seedReceived;
+    extern pthread_mutex_t playerMutex;
+    extern bool inPlane; extern float walkerX,walkerY,walkerZ;
+    short pcmIn[VOICE_FRAME_SAMPLES];
+    unsigned char encoded[VOICE_MAX_BYTES];
+    while(voiceCapRunning){
+        if(!voiceTx){ usleep(5000); continue; }
+        long frames = alsa_pcm_readi(voicePcm, pcmIn, VOICE_FRAME_SAMPLES);
+        if(frames < 0){ alsa_pcm_recover(voicePcm,(int)frames,0); continue; }
+        int encLen = opus_encode(voiceEnc, pcmIn, (int)frames, encoded, VOICE_MAX_BYTES);
+        if(encLen <= 0) continue;
+
+        char pkt[sizeof(int)+sizeof(float)*3+sizeof(int)+VOICE_MAX_BYTES];
+        char *wp = pkt;
+        int type = MSG_VOICE; memcpy(wp,&type,sizeof(int)); wp+=sizeof(int);
+        pthread_mutex_lock(&playerMutex);
+        float px2=inPlane?player.x:walkerX, py2=inPlane?player.y:walkerY, pz2=inPlane?player.z:walkerZ;
+        pthread_mutex_unlock(&playerMutex);
+        memcpy(wp,&px2,4); wp+=4; memcpy(wp,&py2,4); wp+=4; memcpy(wp,&pz2,4); wp+=4;
+        memcpy(wp,&encLen,sizeof(int)); wp+=sizeof(int);
+        memcpy(wp,encoded,encLen);
+        int total=(int)(wp-pkt)+encLen;
+        if((isServer&&clientConnected)||(!isServer&&seedReceived))
+            sendto(sockfd,pkt,total,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
+    }
+    return NULL;
+}
+
+static void voiceStart(){
+    if(!voiceReady) return;
+    voiceCapRunning=true;
+    pthread_create(&voiceCapThread,NULL,voiceCapThreadFunc,NULL);
+}
+
+// ============================================================
 static void queueExplosionBroadcast(float x, float y, float z, float scale){
     pthread_mutex_lock(&explodeMutex);
     int next = (explodeQueueTail+1) % MAX_EXPLODE_QUEUE;
@@ -272,6 +748,7 @@ static void triggerExplosionEx(float x, float y, float z, float speedScale){
             explosions[i].active = true;
             initExplosionParticles(&explosions[i], speedScale);
             queueExplosionBroadcast(x, y, z, speedScale);
+            sndPlay(SND_EXPLOSION);
             return;
         }
     }
@@ -567,29 +1044,192 @@ static void drawPropPlane(float gear){
     // Horizontal stab
     drawWingPanel( 0.02f, 0.38f, -0.60f,-0.82f, -0.65f,-0.84f, 0.03f);
     drawWingPanel(-0.02f,-0.38f, -0.60f,-0.82f, -0.65f,-0.84f, 0.03f);
-    // Windshield
-    glColor3f(0.18f,0.28f,0.50f);
+    // Windshield frame
+    glColor3f(0.35f,0.35f,0.38f);
     glBegin(GL_QUADS);
         glNormal3f(0,0.5f,1);
-        glVertex3f(-0.10f,0.14f,0.65f); glVertex3f( 0.10f,0.14f,0.65f);
-        glVertex3f( 0.10f,0.28f,0.50f); glVertex3f(-0.10f,0.28f,0.50f);
+        glVertex3f(-0.115f,0.12f,0.66f); glVertex3f( 0.115f,0.12f,0.66f);
+        glVertex3f( 0.115f,0.30f,0.49f); glVertex3f(-0.115f,0.30f,0.49f);
     glEnd();
-    // Simple fixed gear (no retraction on prop)
-    glColor3f(0.35f,0.35f,0.38f);
-    for(int s=-1;s<=1;s+=2){
+    // Windshield glass
+    glColor3f(0.18f,0.28f,0.50f);
+    // split into two panes with center post
+    for(int p=-1;p<=1;p+=2){
+        float x0=p*0.01f, x1=p*0.10f;
+        if(p<0){ x0=-0.10f; x1=-0.01f; } else { x0=0.01f; x1=0.10f; }
         glBegin(GL_QUADS);
-            glNormal3f(s,0,0);
-            glVertex3f(s*0.05f,0.0f, 0.05f); glVertex3f(s*0.05f,-0.28f, 0.05f);
-            glVertex3f(s*0.05f,-0.28f,-0.05f); glVertex3f(s*0.05f,0.0f,-0.05f);
-        glEnd();
-        // axle
-        glBegin(GL_QUADS);
-            glNormal3f(0,-1,0);
-            glVertex3f(s*0.05f,-0.28f, 0.04f); glVertex3f(s*0.22f,-0.28f, 0.04f);
-            glVertex3f(s*0.22f,-0.28f,-0.04f); glVertex3f(s*0.05f,-0.28f,-0.04f);
+            glNormal3f(0,0.5f,1);
+            glVertex3f(x0,0.14f,0.65f); glVertex3f(x1,0.14f,0.65f);
+            glVertex3f(x1,0.28f,0.50f); glVertex3f(x0,0.28f,0.50f);
         glEnd();
     }
-    (void)gear;
+    // Spinner hub (round nose piece for propeller)
+    glColor3f(0.60f,0.60f,0.58f);
+    drawOctSegment(0.00f,0.00f,1.14f, 0.06f,0.06f,1.11f);
+    drawOctCap(0.00f,0.00f,1.14f, 0,0,1);
+    // Propeller — 3-blade with proper twist and hub
+    glColor3f(0.20f,0.18f,0.14f);
+    for(int b=0;b<3;b++){
+        glPushMatrix();
+        glRotatef(b*120.0f, 0,0,1);
+        // Blade with chord taper and slight twist
+        glBegin(GL_QUADS);
+            glNormal3f(0,0,1);
+            // root to tip
+            glVertex3f(-0.045f, 0.04f, 1.12f); glVertex3f( 0.045f, 0.04f,1.12f);
+            glVertex3f( 0.035f, 0.10f, 1.12f); glVertex3f(-0.035f, 0.10f,1.12f);
+
+            glVertex3f(-0.035f, 0.10f, 1.12f); glVertex3f( 0.035f, 0.10f,1.12f);
+            glVertex3f( 0.020f, 0.55f, 1.12f); glVertex3f(-0.020f, 0.55f,1.12f);
+        glEnd();
+        // blade tip cap
+        glBegin(GL_TRIANGLES);
+            glNormal3f(0,1,0);
+            glVertex3f(-0.020f,0.55f,1.12f);
+            glVertex3f( 0.020f,0.55f,1.12f);
+            glVertex3f( 0.000f,0.60f,1.12f);
+        glEnd();
+        // blade backface (slightly darker)
+        glColor3f(0.14f,0.12f,0.10f);
+        glBegin(GL_QUADS);
+            glNormal3f(0,0,-1);
+            glVertex3f( 0.045f, 0.04f, 1.118f); glVertex3f(-0.045f, 0.04f,1.118f);
+            glVertex3f(-0.035f, 0.10f, 1.118f); glVertex3f( 0.035f, 0.10f,1.118f);
+
+            glVertex3f( 0.035f, 0.10f, 1.118f); glVertex3f(-0.035f, 0.10f,1.118f);
+            glVertex3f(-0.020f, 0.55f, 1.118f); glVertex3f( 0.020f, 0.55f,1.118f);
+        glEnd();
+        glColor3f(0.20f,0.18f,0.14f);
+        glPopMatrix();
+    }
+    // Door outline (right side)
+    glColor3f(0.60f,0.60f,0.60f);
+    glBegin(GL_LINE_LOOP);
+        glVertex3f( 0.185f, -0.06f,  0.20f);
+        glVertex3f( 0.185f,  0.10f,  0.20f);
+        glVertex3f( 0.185f,  0.10f, -0.10f);
+        glVertex3f( 0.185f, -0.06f, -0.10f);
+    glEnd();
+    // Registration markings — dark hash marks on tail (faked as a stripe)
+    glColor3f(0.10f,0.10f,0.10f);
+    glBegin(GL_QUADS);
+        glNormal3f(1,0,0);
+        glVertex3f( 0.185f,-0.03f,-0.42f); glVertex3f( 0.185f,-0.03f,-0.55f);
+        glVertex3f( 0.185f, 0.03f,-0.55f); glVertex3f( 0.185f, 0.03f,-0.42f);
+    glEnd();
+    glBegin(GL_QUADS);
+        glNormal3f(-1,0,0);
+        glVertex3f(-0.185f,-0.03f,-0.42f); glVertex3f(-0.185f, 0.03f,-0.42f);
+        glVertex3f(-0.185f, 0.03f,-0.55f); glVertex3f(-0.185f,-0.03f,-0.55f);
+    glEnd();
+    // Fixed tricycle gear — always present, strut compresses when on ground (gear→1)
+    // Strut compression: on ground strut is shorter, wheel is closer to fuselage
+    float strutCompress = gear * 0.06f;  // up to 6% shorter when on ground
+
+    // Main gear legs + wheel fairings
+    for(int s=-1;s<=1;s+=2){
+        float legBot = -0.28f + strutCompress;   // bottom of strut (rises when compressed)
+        glColor3f(0.35f,0.35f,0.38f);
+        // Vertical strut
+        glBegin(GL_QUADS);
+            glNormal3f(s,0,0);
+            glVertex3f(s*0.05f, 0.0f,  0.05f); glVertex3f(s*0.05f, legBot, 0.05f);
+            glVertex3f(s*0.05f, legBot,-0.05f); glVertex3f(s*0.05f, 0.0f, -0.05f);
+        glEnd();
+        // Axle strut (horizontal arm to wheel)
+        glBegin(GL_QUADS);
+            glNormal3f(0,-1,0);
+            glVertex3f(s*0.05f, legBot, 0.04f); glVertex3f(s*0.22f, legBot, 0.04f);
+            glVertex3f(s*0.22f, legBot,-0.04f); glVertex3f(s*0.05f, legBot,-0.04f);
+        glEnd();
+        // Wheel fairing (teardrop streamline cover)
+        glColor3f(0.85f,0.85f,0.82f);
+        glPushMatrix(); glTranslatef(s*0.22f, legBot, 0.0f);
+        drawOctSegment(0.11f,0.09f, 0.12f, 0.11f,0.09f,-0.14f);
+        drawOctCap(0.11f,0.09f,  0.12f, 0,0, 1);
+        drawOctCap(0.11f,0.09f, -0.14f, 0,0,-1);
+        // Main wheel tire (inside fairing)
+        glColor3f(0.10f,0.10f,0.10f);
+        for(int side=-1;side<=1;side+=2){
+            glNormal3f(0,0,side);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(0,0,side*0.055f);
+                for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                    glVertex3f(cosf(a)*0.095f,sinf(a)*0.095f,side*0.055f); }
+            glEnd();
+        }
+        glBegin(GL_TRIANGLE_STRIP);
+        for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+            glNormal3f(cosf(a),sinf(a),0);
+            glVertex3f(cosf(a)*0.095f,sinf(a)*0.095f, 0.055f);
+            glVertex3f(cosf(a)*0.095f,sinf(a)*0.095f,-0.055f);
+        }
+        glEnd();
+        // Hub cap
+        glColor3f(0.55f,0.55f,0.58f);
+        glNormal3f(0,0,1);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(0,0,0.057f);
+            for(int i=0;i<=6;i++){ float a=i*6.28318f/6;
+                glVertex3f(cosf(a)*0.035f,sinf(a)*0.035f,0.057f); }
+        glEnd();
+        glPopMatrix();
+        glColor3f(0.35f,0.35f,0.38f);
+    }
+    // Nose gear (steerable front leg)
+    {
+        float nlegBot = -0.22f + strutCompress;
+        glColor3f(0.35f,0.35f,0.38f);
+        // Strut
+        glBegin(GL_QUADS);
+            glNormal3f(1,0,0);
+            glVertex3f( 0.025f, 0.0f, 0.025f); glVertex3f( 0.025f, nlegBot, 0.025f);
+            glVertex3f( 0.025f, nlegBot,-0.025f); glVertex3f( 0.025f, 0.0f,-0.025f);
+            glNormal3f(-1,0,0);
+            glVertex3f(-0.025f, 0.0f, 0.025f); glVertex3f(-0.025f, 0.0f,-0.025f);
+            glVertex3f(-0.025f, nlegBot,-0.025f); glVertex3f(-0.025f, nlegBot, 0.025f);
+            glNormal3f(0,0, 1);
+            glVertex3f(-0.025f, 0.0f, 0.025f); glVertex3f( 0.025f, 0.0f, 0.025f);
+            glVertex3f( 0.025f, nlegBot, 0.025f); glVertex3f(-0.025f, nlegBot, 0.025f);
+            glNormal3f(0,0,-1);
+            glVertex3f(-0.025f, 0.0f,-0.025f); glVertex3f(-0.025f, nlegBot,-0.025f);
+            glVertex3f( 0.025f, nlegBot,-0.025f); glVertex3f( 0.025f, 0.0f,-0.025f);
+        glEnd();
+        // Nose wheel
+        glColor3f(0.10f,0.10f,0.10f);
+        glPushMatrix(); glTranslatef(0.0f, nlegBot, 0.0f);
+        float nwr=0.065f, nwt=0.040f;
+        for(int side=-1;side<=1;side+=2){
+            glNormal3f(0,0,side);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(0,0,side*nwt);
+                for(int i=0;i<=8;i++){ float a=i*6.28318f/8;
+                    glVertex3f(cosf(a)*nwr,sinf(a)*nwr,side*nwt); }
+            glEnd();
+        }
+        glBegin(GL_TRIANGLE_STRIP);
+        for(int i=0;i<=8;i++){ float a=i*6.28318f/8;
+            glNormal3f(cosf(a),sinf(a),0);
+            glVertex3f(cosf(a)*nwr,sinf(a)*nwr, nwt);
+            glVertex3f(cosf(a)*nwr,sinf(a)*nwr,-nwt);
+        }
+        glEnd();
+        glColor3f(0.55f,0.55f,0.58f);
+        glNormal3f(0,0,1);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(0,0,nwt+0.004f);
+            for(int i=0;i<=6;i++){ float a=i*6.28318f/6;
+                glVertex3f(cosf(a)*0.025f,sinf(a)*0.025f,nwt+0.004f); }
+        glEnd();
+        glPopMatrix();
+    }
+    // Tail skid (small rubber pad under tail)
+    glColor3f(0.15f,0.15f,0.15f);
+    glBegin(GL_QUADS);
+        glNormal3f(0,-1,0);
+        glVertex3f(-0.025f,-0.10f,-0.82f); glVertex3f( 0.025f,-0.10f,-0.82f);
+        glVertex3f( 0.025f,-0.10f,-0.88f); glVertex3f(-0.025f,-0.10f,-0.88f);
+    glEnd();
 }
 
 // ---- Boeing 737-style airliner (wide body, 4 engines, passenger windows) ----
@@ -640,18 +1280,66 @@ static void drawAirliner(float gear){
     drawWingPanel( 1.20f, 2.20f, -0.20f,-0.90f, -0.60f,-1.20f, 0.07f);
     drawWingPanel(-0.40f,-1.20f,  0.40f,-0.40f, -0.20f,-0.90f, 0.12f);
     drawWingPanel(-1.20f,-2.20f, -0.20f,-0.90f, -0.60f,-1.20f, 0.07f);
-    // 4 engine pods
+    // 4 engine pods with fan faces and pylons
     for(int e=0;e<4;e++){
         float ex = (e<2 ? 0.90f : 1.70f) * (e%2==0 ? 1 : -1);
         glPushMatrix(); glTranslatef(ex, -0.14f, 0.10f);
+        // Engine pylon (connects wing to pod)
+        glColor3f(0.78f,0.78f,0.80f);
+        glBegin(GL_QUADS);
+            glNormal3f(0,1,0);
+            glVertex3f(-0.025f,0.10f, 0.20f); glVertex3f( 0.025f,0.10f, 0.20f);
+            glVertex3f( 0.025f,0.10f,-0.30f); glVertex3f(-0.025f,0.10f,-0.30f);
+        glEnd();
+        glBegin(GL_QUADS);
+            glNormal3f(1,0,0);
+            glVertex3f(0.025f,0.10f, 0.20f); glVertex3f(0.025f,-0.01f, 0.20f);
+            glVertex3f(0.025f,-0.01f,-0.30f); glVertex3f(0.025f,0.10f,-0.30f);
+        glEnd();
+        glBegin(GL_QUADS);
+            glNormal3f(-1,0,0);
+            glVertex3f(-0.025f,0.10f, 0.20f); glVertex3f(-0.025f,0.10f,-0.30f);
+            glVertex3f(-0.025f,-0.01f,-0.30f); glVertex3f(-0.025f,-0.01f, 0.20f);
+        glEnd();
+        // Nacelle body
         glColor3f(0.40f,0.40f,0.45f);
         drawOctSegment(0.12f,0.10f, 0.55f, 0.12f,0.10f,-0.55f);
+        // Intake lip (forward nacelle flare)
         glColor3f(0.55f,0.55f,0.60f);
         drawOctSegment(0.12f,0.10f, 0.55f, 0.15f,0.13f, 0.65f);
         drawOctCap(0.15f,0.13f, 0.65f, 0,0,1);
+        // Fan face (visible inside intake)
+        glColor3f(0.18f,0.18f,0.20f);
+        glBegin(GL_TRIANGLE_FAN);
+            glNormal3f(0,0,1);
+            glVertex3f(0,0,0.55f);
+            for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                glVertex3f(cosf(a)*0.115f,sinf(a)*0.115f,0.55f); }
+        glEnd();
+        // Fan blades
+        glColor3f(0.30f,0.30f,0.34f);
+        for(int fb=0;fb<8;fb++){
+            float fa=fb*6.28318f/8;
+            glBegin(GL_QUADS);
+                glNormal3f(0,0,1);
+                glVertex3f(cosf(fa)*0.025f,sinf(fa)*0.025f,0.552f);
+                glVertex3f(cosf(fa+0.18f)*0.025f,sinf(fa+0.18f)*0.025f,0.552f);
+                glVertex3f(cosf(fa+0.12f)*0.110f,sinf(fa+0.12f)*0.110f,0.552f);
+                glVertex3f(cosf(fa)*0.110f,sinf(fa)*0.110f,0.552f);
+            glEnd();
+        }
+        // Exhaust nozzle
         glColor3f(0.28f,0.28f,0.30f);
         drawOctSegment(0.12f,0.10f,-0.55f, 0.08f,0.07f,-0.70f);
         drawOctCap(0.08f,0.07f,-0.70f, 0,0,-1);
+        // Exhaust plug (dark centre)
+        glColor3f(0.15f,0.15f,0.16f);
+        glBegin(GL_TRIANGLE_FAN);
+            glNormal3f(0,0,-1);
+            glVertex3f(0,0,-0.66f);
+            for(int i=0;i<=8;i++){ float a=i*6.28318f/8;
+                glVertex3f(cosf(a)*0.05f,sinf(a)*0.05f,-0.66f); }
+        glEnd();
         glPopMatrix();
     }
     // Vertical stabilizer (large) — two side faces + leading/trailing edges + top cap
@@ -693,53 +1381,212 @@ static void drawAirliner(float gear){
     glColor3f(0.88f,0.88f,0.90f);
     drawWingPanel( 0.04f, 0.70f, -1.60f,-2.00f, -1.70f,-2.05f, 0.06f);
     drawWingPanel(-0.04f,-0.70f, -1.60f,-2.00f, -1.70f,-2.05f, 0.06f);
-    // Landing gear
+    // Winglets (angled tip fins at each wingtip)
+    glColor3f(0.10f,0.30f,0.75f);
+    for(int s=-1;s<=1;s+=2){
+        float wx = s*2.20f;
+        // winglet side faces
+        for(int side=-1;side<=1;side+=2){
+            glNormal3f(0,0,side);
+            glBegin(GL_QUADS);
+                glVertex3f(wx,         0.00f, side*0.035f + (side>0?-0.60f:-1.20f));
+                glVertex3f(wx,         0.00f, side*0.035f + (side>0?-1.20f:-0.60f));
+                glVertex3f(wx+s*0.00f, 0.38f, (side>0?-0.72f:-1.08f));
+                glVertex3f(wx+s*0.00f, 0.38f, (side>0?-1.08f:-0.72f));
+            glEnd();
+        }
+        // winglet leading edge
+        glBegin(GL_QUADS); glNormal3f(0,0,1);
+            glVertex3f(wx,        0.00f,-0.60f); glVertex3f(wx,        0.38f,-0.72f);
+            glVertex3f(wx,        0.38f,-0.72f); glVertex3f(wx,        0.00f,-0.60f);
+        glEnd();
+        // winglet top cap
+        glBegin(GL_QUADS); glNormal3f(0,1,0);
+            glVertex3f(wx-0.035f, 0.38f,-0.72f); glVertex3f(wx+0.035f, 0.38f,-0.72f);
+            glVertex3f(wx+0.035f, 0.38f,-1.08f); glVertex3f(wx-0.035f, 0.38f,-1.08f);
+        glEnd();
+    }
+    // Window frames (thin border around each pane)
+    glColor3f(0.75f,0.75f,0.78f);
+    for(int w=0;w<10;w++){
+        float wz = 1.30f - w * 0.28f;
+        if(wz < -0.90f) break;
+        for(int side=-1;side<=1;side+=2){
+            float wx2 = side*0.437f;
+            glBegin(GL_LINE_LOOP);
+                glVertex3f(wx2, 0.07f, wz+0.07f);
+                glVertex3f(wx2, 0.07f, wz-0.07f);
+                glVertex3f(wx2, 0.21f, wz-0.07f);
+                glVertex3f(wx2, 0.21f, wz+0.07f);
+            glEnd();
+        }
+    }
+    // Nose radome tip (darker composite cone)
+    glColor3f(0.22f,0.22f,0.24f);
+    drawOctSegment(0.00f,0.00f, 2.40f, 0.10f,0.10f, 2.20f);
+    drawOctCap(0.00f,0.00f, 2.40f, 0,0,1);
+    // Landing gear — retracts/deploys with gear param (0=up, 1=down)
     if(gear > 0.001f){
         float deployAngle = gear * 90.0f;
-        // Nose gear
+        float compress = gear * 0.08f; // strut compression when on ground
+
+        // ---- Nose gear (folds forward into nose bay) ----
         glPushMatrix();
-        glTranslatef(0.0f,-0.26f,1.60f);
-        glRotatef(-(90.0f-deployAngle),1,0,0);
+        glTranslatef(0.0f, -0.26f, 1.60f);
+        glRotatef(-(90.0f - deployAngle), 1, 0, 0);
+        float nsh = 0.50f * gear - compress;
         glColor3f(0.35f,0.35f,0.38f);
+        // Strut (front + back + sides)
         glBegin(GL_QUADS);
-            glNormal3f(1,0,0);
-            glVertex3f( 0.05f,0,-0.02f); glVertex3f( 0.05f,-0.50f*gear,-0.02f);
-            glVertex3f( 0.05f,-0.50f*gear,0.02f); glVertex3f( 0.05f,0,0.02f);
+            glNormal3f( 1,0,0);
+            glVertex3f( 0.05f, 0.0f, -0.025f); glVertex3f( 0.05f, -nsh, -0.025f);
+            glVertex3f( 0.05f, -nsh,  0.025f); glVertex3f( 0.05f, 0.0f,  0.025f);
             glNormal3f(-1,0,0);
-            glVertex3f(-0.05f,0,-0.02f); glVertex3f(-0.05f,0,0.02f);
-            glVertex3f(-0.05f,-0.50f*gear,0.02f); glVertex3f(-0.05f,-0.50f*gear,-0.02f);
+            glVertex3f(-0.05f, 0.0f, -0.025f); glVertex3f(-0.05f, 0.0f,  0.025f);
+            glVertex3f(-0.05f, -nsh,  0.025f); glVertex3f(-0.05f, -nsh, -0.025f);
+            glNormal3f(0,0, 1);
+            glVertex3f(-0.05f, 0.0f, 0.025f); glVertex3f( 0.05f, 0.0f, 0.025f);
+            glVertex3f( 0.05f, -nsh, 0.025f); glVertex3f(-0.05f, -nsh, 0.025f);
+            glNormal3f(0,0,-1);
+            glVertex3f(-0.05f, 0.0f,-0.025f); glVertex3f(-0.05f, -nsh,-0.025f);
+            glVertex3f( 0.05f, -nsh,-0.025f); glVertex3f( 0.05f, 0.0f,-0.025f);
         glEnd();
+        // Nose wheel (dual, narrow)
+        glTranslatef(0.0f, -nsh, 0.0f);
+        glColor3f(0.10f,0.10f,0.10f);
+        float nwr = 0.10f, nwt = 0.045f;
+        for(int w = -1; w <= 1; w += 2){
+            glPushMatrix(); glTranslatef(0, 0, w * 0.06f);
+            for(int side=-1;side<=1;side+=2){
+                glNormal3f(0,0,side);
+                glBegin(GL_TRIANGLE_FAN);
+                    glVertex3f(0,0,side*nwt);
+                    for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                        glVertex3f(cosf(a)*nwr,sinf(a)*nwr,side*nwt); }
+                glEnd();
+            }
+            glBegin(GL_TRIANGLE_STRIP);
+            for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                glNormal3f(cosf(a),sinf(a),0);
+                glVertex3f(cosf(a)*nwr,sinf(a)*nwr, nwt);
+                glVertex3f(cosf(a)*nwr,sinf(a)*nwr,-nwt);
+            }
+            glEnd();
+            // Hub
+            glColor3f(0.52f,0.52f,0.55f);
+            glNormal3f(0,0,1);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(0,0,nwt+0.004f);
+                for(int i=0;i<=6;i++){ float a=i*6.28318f/6;
+                    glVertex3f(cosf(a)*0.04f,sinf(a)*0.04f,nwt+0.004f); }
+            glEnd();
+            glColor3f(0.10f,0.10f,0.10f);
+            glPopMatrix();
+        }
         glPopMatrix();
-        // Main gear (4 wheels each side)
+
+        // ---- Main gear (bogies, fold inward under wing) ----
+        for(int s = -1; s <= 1; s += 2){
+            glPushMatrix();
+            glTranslatef(s * 0.58f, -0.26f, -0.10f);
+            glRotatef(s * (90.0f - deployAngle), 0, 0, 1);
+            glColor3f(0.35f,0.35f,0.38f);
+            float sh = 0.55f * gear - compress;
+
+            // Main strut
+            glBegin(GL_QUADS);
+                glNormal3f( 1,0,0);
+                glVertex3f( 0.05f, 0.0f,-0.05f); glVertex3f( 0.05f,-sh,-0.05f);
+                glVertex3f( 0.05f,-sh, 0.05f);   glVertex3f( 0.05f, 0.0f, 0.05f);
+                glNormal3f(-1,0,0);
+                glVertex3f(-0.05f, 0.0f,-0.05f); glVertex3f(-0.05f, 0.0f, 0.05f);
+                glVertex3f(-0.05f,-sh, 0.05f);   glVertex3f(-0.05f,-sh,-0.05f);
+                glNormal3f(0,0, 1);
+                glVertex3f(-0.05f, 0.0f, 0.05f); glVertex3f( 0.05f, 0.0f, 0.05f);
+                glVertex3f( 0.05f,-sh,  0.05f);  glVertex3f(-0.05f,-sh,  0.05f);
+                glNormal3f(0,0,-1);
+                glVertex3f(-0.05f, 0.0f,-0.05f); glVertex3f(-0.05f,-sh,-0.05f);
+                glVertex3f( 0.05f,-sh,-0.05f);   glVertex3f( 0.05f, 0.0f,-0.05f);
+            glEnd();
+
+            // Bogie beam (horizontal axle bar)
+            glTranslatef(0.0f, -sh, 0.0f);
+            glBegin(GL_QUADS);
+                glNormal3f(0,0,1);
+                glVertex3f(-0.04f, 0.03f, 0.04f); glVertex3f( 0.04f, 0.03f, 0.04f);
+                glVertex3f( 0.04f,-0.03f, 0.04f); glVertex3f(-0.04f,-0.03f, 0.04f);
+                glNormal3f(0,0,-1);
+                glVertex3f(-0.04f,-0.03f,-0.24f); glVertex3f( 0.04f,-0.03f,-0.24f);
+                glVertex3f( 0.04f, 0.03f,-0.24f); glVertex3f(-0.04f, 0.03f,-0.24f);
+                glNormal3f(0,1,0);
+                glVertex3f(-0.04f, 0.03f,-0.24f); glVertex3f( 0.04f, 0.03f,-0.24f);
+                glVertex3f( 0.04f, 0.03f, 0.04f); glVertex3f(-0.04f, 0.03f, 0.04f);
+                glNormal3f(0,-1,0);
+                glVertex3f(-0.04f,-0.03f, 0.04f); glVertex3f( 0.04f,-0.03f, 0.04f);
+                glVertex3f( 0.04f,-0.03f,-0.24f); glVertex3f(-0.04f,-0.03f,-0.24f);
+            glEnd();
+
+            // 4 wheels: 2 axle positions × 2 per axle
+            float axleZ[2] = { 0.02f, -0.22f };
+            float wr = 0.13f, wt = 0.055f;
+            for(int ax = 0; ax < 2; ax++){
+                for(int w = -1; w <= 1; w += 2){
+                    glPushMatrix(); glTranslatef(0, 0, axleZ[ax] + w * 0.10f);
+                    glColor3f(0.10f,0.10f,0.10f);
+                    for(int side=-1;side<=1;side+=2){
+                        glNormal3f(0,0,side);
+                        glBegin(GL_TRIANGLE_FAN);
+                            glVertex3f(0,0,side*wt);
+                            for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                                glVertex3f(cosf(a)*wr,sinf(a)*wr,side*wt); }
+                        glEnd();
+                    }
+                    glBegin(GL_TRIANGLE_STRIP);
+                    for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
+                        glNormal3f(cosf(a),sinf(a),0);
+                        glVertex3f(cosf(a)*wr,sinf(a)*wr, wt);
+                        glVertex3f(cosf(a)*wr,sinf(a)*wr,-wt);
+                    }
+                    glEnd();
+                    // Hub cap
+                    glColor3f(0.52f,0.52f,0.55f);
+                    glNormal3f(0,0,1);
+                    glBegin(GL_TRIANGLE_FAN);
+                        glVertex3f(0,0,wt+0.005f);
+                        for(int i=0;i<=6;i++){ float a=i*6.28318f/6;
+                            glVertex3f(cosf(a)*0.05f,sinf(a)*0.05f,wt+0.005f); }
+                    glEnd();
+                    glPopMatrix();
+                }
+            }
+            glPopMatrix();
+        }
+
+        // Gear bay doors
+        float doorAngle = gear * 70.0f;
+        glColor3f(0.88f,0.88f,0.90f);
+        // Nose doors (two halves)
         for(int s=-1;s<=1;s+=2){
             glPushMatrix();
-            glTranslatef(s*0.55f,-0.26f,-0.10f);
-            glRotatef(s*(90.0f-deployAngle),0,0,1);
-            glColor3f(0.35f,0.35f,0.38f);
-            float sh = 0.55f*gear;
+            glTranslatef(s*0.06f, -0.26f, 1.60f);
+            glRotatef(s*doorAngle, 0, 0, 1);
+            glNormal3f(0,-1,0);
             glBegin(GL_QUADS);
-                glNormal3f(1,0,0);
-                glVertex3f(0.05f,0,-0.05f); glVertex3f(0.05f,-sh,-0.05f);
-                glVertex3f(0.05f,-sh,0.05f); glVertex3f(0.05f,0,0.05f);
-                glNormal3f(-1,0,0);
-                glVertex3f(-0.05f,0,-0.05f); glVertex3f(-0.05f,0,0.05f);
-                glVertex3f(-0.05f,-sh,0.05f); glVertex3f(-0.05f,-sh,-0.05f);
+                glVertex3f(0,0, 0.25f); glVertex3f(s*0.14f,0, 0.25f);
+                glVertex3f(s*0.14f,0,-0.08f); glVertex3f(0,0,-0.08f);
             glEnd();
-            glTranslatef(0,-sh,0);
-            glColor3f(0.12f,0.12f,0.12f);
-            float wr=0.13f, wt=0.06f;
-            for(int w=-1;w<=1;w+=2){
-                glPushMatrix(); glTranslatef(0,0,w*0.10f);
-                for(int side=-1;side<=1;side+=2){
-                    glNormal3f(0,0,side);
-                    glBegin(GL_TRIANGLE_FAN);
-                        glVertex3f(0,0,side*wt);
-                        for(int i=0;i<=10;i++){ float a=i*6.28318f/10;
-                            glVertex3f(cosf(a)*wr,sinf(a)*wr,side*wt); }
-                    glEnd();
-                }
-                glPopMatrix();
-            }
+            glPopMatrix();
+        }
+        // Main gear doors
+        for(int s=-1;s<=1;s+=2){
+            glPushMatrix();
+            glTranslatef(s*0.58f, -0.26f, -0.10f);
+            glRotatef(-s*doorAngle, 1, 0, 0);
+            glNormal3f(0,-1,0);
+            glBegin(GL_QUADS);
+                glVertex3f(-s*0.20f,0, 0.28f); glVertex3f(s*0.06f,0, 0.28f);
+                glVertex3f(s*0.06f,0,-0.30f);  glVertex3f(-s*0.20f,0,-0.30f);
+            glEnd();
             glPopMatrix();
         }
     }
@@ -1128,6 +1975,122 @@ void drawPlaneModel(float x,float y,float z,float pitch,float yaw,float roll,flo
         glVertex3f(-0.008f, 0.005f, 1.65f); glVertex3f(-0.008f,-0.005f, 1.65f);
     glEnd();
 
+    // ---- WING FENCES (vortex fences at ~60% span) ----
+    glColor3f(0.54f,0.55f,0.61f);
+    for(int side=-1;side<=1;side+=2){
+        float fx = side*0.93f;
+        glBegin(GL_QUADS);
+            glNormal3f(side,0,0);
+            glVertex3f(fx, 0.0f,  0.02f); glVertex3f(fx, 0.0f, -0.32f);
+            glVertex3f(fx, 0.06f,-0.32f); glVertex3f(fx, 0.06f, 0.02f);
+        glEnd();
+        // top cap of fence
+        glBegin(GL_QUADS);
+            glNormal3f(0,1,0);
+            glVertex3f(fx-side*0.003f,0.06f, 0.02f); glVertex3f(fx+side*0.003f,0.06f, 0.02f);
+            glVertex3f(fx+side*0.003f,0.06f,-0.32f);  glVertex3f(fx-side*0.003f,0.06f,-0.32f);
+        glEnd();
+    }
+
+    // ---- UNDERWING STORES (2 missiles each side) ----
+    glColor3f(0.40f,0.42f,0.48f);
+    for(int side=-1;side<=1;side+=2){
+        for(int w=0;w<2;w++){
+            float sx = side*(0.50f + w*0.45f);
+            glPushMatrix(); glTranslatef(sx, -0.045f, 0.0f);
+            // missile body
+            drawOctSegment(0.025f,0.025f, 0.28f, 0.025f,0.025f,-0.28f);
+            drawOctCap(0.025f,0.025f, 0.28f, 0,0,1);
+            // cone nose
+            drawOctSegment(0.025f,0.025f, 0.28f, 0.0f,0.0f, 0.38f);
+            drawOctCap(0.0f,0.0f, 0.38f, 0,0,1);
+            // small fins
+            glColor3f(0.38f,0.40f,0.46f);
+            for(int f2=0;f2<4;f2++){
+                glPushMatrix(); glRotatef(f2*90.0f, 0,0,1);
+                glBegin(GL_QUADS); glNormal3f(0,1,0);
+                    glVertex3f(-0.005f, 0.025f,-0.20f); glVertex3f( 0.005f, 0.025f,-0.20f);
+                    glVertex3f( 0.005f, 0.07f, -0.26f); glVertex3f(-0.005f, 0.07f, -0.26f);
+                glEnd();
+                glPopMatrix();
+            }
+            glColor3f(0.40f,0.42f,0.48f);
+            glPopMatrix();
+        }
+    }
+
+    // ---- EXHAUST NOZZLES (twin) ----
+    for(int side=-1;side<=1;side+=2){
+        float nx2 = side*0.10f;
+        glPushMatrix(); glTranslatef(nx2, -0.02f, -1.30f);
+        // outer nozzle ring
+        glColor3f(0.28f,0.28f,0.30f);
+        drawOctSegment(0.07f,0.06f, 0.0f, 0.07f,0.06f,-0.10f);
+        // petals (slightly darker flaps)
+        glColor3f(0.22f,0.22f,0.24f);
+        for(int p=0;p<8;p++){
+            float a0=p*3.14159f*2/8, a1=(p+1)*3.14159f*2/8;
+            glBegin(GL_QUADS); glNormal3f(0,0,-1);
+                glVertex3f(cosf(a0)*0.065f, sinf(a0)*0.06f, -0.10f);
+                glVertex3f(cosf(a1)*0.065f, sinf(a1)*0.06f, -0.10f);
+                glVertex3f(cosf(a1)*0.045f, sinf(a1)*0.04f, -0.14f);
+                glVertex3f(cosf(a0)*0.045f, sinf(a0)*0.04f, -0.14f);
+            glEnd();
+        }
+        // afterburner glow (additive orange disc)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDisable(GL_LIGHTING);
+        glColor4f(1.0f,0.5f,0.05f,0.45f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(0,0,-0.12f);
+            for(int i=0;i<=12;i++){ float a=i*3.14159f*2/12;
+                glVertex3f(cosf(a)*0.05f, sinf(a)*0.04f, -0.12f); }
+        glEnd();
+        glEnable(GL_LIGHTING);
+        glDisable(GL_BLEND);
+        glPopMatrix();
+    }
+
+    // ---- PANEL LINES (fine surface detail) ----
+    glColor3f(0.50f,0.51f,0.57f);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+        // fuselage access panels
+        glVertex3f(-0.23f, 0.0f, 0.60f); glVertex3f( 0.23f, 0.0f, 0.60f);
+        glVertex3f(-0.23f, 0.0f, 0.10f); glVertex3f( 0.23f, 0.0f, 0.10f);
+        glVertex3f(-0.23f, 0.0f,-0.40f); glVertex3f( 0.23f, 0.0f,-0.40f);
+        // wing panel joints
+        glVertex3f( 0.23f, 0.03f, 0.00f); glVertex3f( 0.85f, 0.01f,-0.40f);
+        glVertex3f(-0.23f, 0.03f, 0.00f); glVertex3f(-0.85f, 0.01f,-0.40f);
+        // leading edge seam
+        glVertex3f( 0.23f, 0.03f, 0.12f); glVertex3f( 1.55f,-0.01f,-0.28f);
+        glVertex3f(-0.23f, 0.03f, 0.12f); glVertex3f(-1.55f,-0.01f,-0.28f);
+    glEnd();
+
+    // ---- VHF ANTENNA (dorsal blade) ----
+    glColor3f(0.30f,0.30f,0.33f);
+    glBegin(GL_QUADS);
+        glNormal3f(1,0,0);
+        glVertex3f( 0.004f, 0.22f, 0.30f); glVertex3f( 0.004f, 0.22f,-0.10f);
+        glVertex3f( 0.004f, 0.32f,-0.02f); glVertex3f( 0.004f, 0.32f, 0.20f);
+        glNormal3f(-1,0,0);
+        glVertex3f(-0.004f, 0.22f, 0.30f); glVertex3f(-0.004f, 0.32f, 0.20f);
+        glVertex3f(-0.004f, 0.32f,-0.02f); glVertex3f(-0.004f, 0.22f,-0.10f);
+        glNormal3f(0,1,0);
+        glVertex3f(-0.004f, 0.32f, 0.20f); glVertex3f( 0.004f, 0.32f, 0.20f);
+        glVertex3f( 0.004f, 0.32f,-0.02f); glVertex3f(-0.004f, 0.32f,-0.02f);
+    glEnd();
+
+    // ---- INTAKE LIPS (beveled forward edge of engine inlets) ----
+    glColor3f(0.60f,0.61f,0.67f);
+    for(int side=-1;side<=1;side+=2){
+        float bx = side*0.72f;
+        glPushMatrix(); glTranslatef(bx, -0.10f, 0.46f);
+        drawOctSegment(0.11f,0.09f, 0.0f, 0.09f,0.07f,-0.05f);
+        drawOctCap(0.11f,0.09f, 0.0f, 0,0,1);
+        glPopMatrix();
+    }
+
     glPopMatrix();
 }
 
@@ -1137,6 +2100,12 @@ static float terrainH[TN][TN];
 static float terrainNX[TN][TN];
 static float terrainNY[TN][TN];
 static float terrainNZ[TN][TN];
+// Pre-baked per-vertex colors and biome index (computed once after terrain gen)
+static unsigned char terrainCR[TN][TN];
+static unsigned char terrainCG[TN][TN];
+static unsigned char terrainCB[TN][TN];
+static unsigned char terrainBiome[TN][TN]; // 0=water 1=sand 2=grass 3=highland 4=rock 5=snow
+
 
 // Simple value noise: hash grid coords to a pseudo-random float in [-1,1]
 static float vnoise(int x, int z){
@@ -1205,6 +2174,18 @@ static void generateTerrainBase(){
 float terrainHeightAt(float wx, float wz); // forward declaration
 void  generateAllTerrain(unsigned int seed); // forward declaration
 void  generateAirportName(char *out, int idx); // forward declaration
+static void renderNpcs(); // forward declaration
+static void updateNpcs(float dt); // forward declaration
+static void renderMissiles(); // forward declaration
+static void updateMissiles(float dt); // forward declaration
+static void fireMissile(); // forward declaration
+static void lanBroadcastPresence(); // forward declaration
+static void updateLanServers(float dt); // forward declaration
+static bool voiceInit(); // forward declaration
+static void voiceStart(); // forward declaration
+static void voiceReceive(const char *buf, int n); // forward declaration
+static void menuRect(float x,float y,float w,float h,float r,float g,float b,float a); // forward decl
+static void menuRectOutline(float x,float y,float w,float h,float r,float g,float b); // forward decl
 
 // Sample average base height over a world-space circle of radius r
 static float sampleAvgHeight(float wx, float wz, float radius){
@@ -1286,6 +2267,37 @@ static void terrainColor(float h, float nx, float ny, float nz){
         b=b*(1-blend)+0.37f*blend;
     }
     glColor3f(r,g,b);
+}
+
+// Bake terrain colors into byte arrays so renderTerrain() avoids per-vertex recalc.
+// Called once at the end of generateAllTerrain() and after any re-flattening.
+static void bakeTerrainColors(){
+    for(int z=0;z<TN;z++)
+        for(int x=0;x<TN;x++){
+            float h2 = terrainH[z][x];
+            float ny = terrainNY[z][x];
+            float slope = 1.0f - ny;
+            float t = h2 / TERRAIN_HEIGHT;
+            float r,g,b;
+            int biome;
+            if(t < 0.03f){      r=0.15f; g=0.28f; b=0.62f; biome=0; } // water
+            else if(t < 0.07f){ r=0.76f; g=0.70f; b=0.50f; biome=1; } // sand
+            else if(t < 0.35f){ r=0.22f; g=0.50f; b=0.16f; biome=2; } // grass
+            else if(t < 0.60f){ r=0.28f; g=0.43f; b=0.18f; biome=2; } // highland grass
+            else if(t < 0.78f){ r=0.50f; g=0.46f; b=0.38f; biome=3; } // rock
+            else {              r=0.88f; g=0.90f; b=0.93f; biome=4; } // snow
+            if(slope > 0.3f){
+                float blend = clampf((slope-0.3f)/0.35f, 0.0f, 1.0f);
+                r=r*(1-blend)+0.48f*blend;
+                g=g*(1-blend)+0.44f*blend;
+                b=b*(1-blend)+0.37f*blend;
+                if(blend > 0.5f) biome=3; // steep = rock
+            }
+            terrainCR[z][x]=(unsigned char)(r*255);
+            terrainCG[z][x]=(unsigned char)(g*255);
+            terrainCB[z][x]=(unsigned char)(b*255);
+            terrainBiome[z][x]=(unsigned char)biome;
+        }
 }
 
 // -------- Airports --------
@@ -1411,7 +2423,7 @@ void generateAirports(){
         bool tooClose = false;
         for(int i=0;i<numAirports;i++){
             float dx=wx-airports[i].wx, dz=wz-airports[i].wz;
-            if(sqrtf(dx*dx+dz*dz)<130.0f){ tooClose=true; break; }
+            if(sqrtf(dx*dx+dz*dz)<220.0f){ tooClose=true; break; }
         }
         if(tooClose) continue;
 
@@ -1441,6 +2453,38 @@ void generateAirports(){
     // normals are recomputed globally by generateTerrainDetail() after this returns
 }
 
+static void spawnNpcsForAirports(){
+    numNpcs = 0;
+    for(int ai=0;ai<numAirports && numNpcs<MAX_NPCS;ai++){
+        Airport *ap = &airports[ai];
+        int count = 2 + ap->size * 2; // 2-6 NPCs per airport
+        float twW    = 3.5f;
+        float twCenZ = ap->runwayW + 2.0f + twW;
+        float apronZ0 = twCenZ + twW;
+        float apronHalfX = (2 + ap->size*2 - 1) * 8.0f * 0.5f + 5.0f;
+        for(int n=0;n<count && numNpcs<MAX_NPCS;n++){
+            Npc *npc = &npcs[numNpcs++];
+            memset(npc, 0, sizeof(*npc));
+            // Scatter across apron
+            float lx = ((float)rand()/RAND_MAX - 0.5f) * apronHalfX * 2.0f;
+            float lz = apronZ0 + ((float)rand()/RAND_MAX) * 10.0f;
+            float wx, wz;
+            apLocalToWorld(ap, lx, lz, &wx, &wz);
+            npc->x = wx;
+            npc->z = wz;
+            npc->y = ap->groundY;
+            npc->yaw = ((float)rand()/RAND_MAX) * 6.2832f;
+            npc->homeX = wx; npc->homeZ = wz;
+            npc->airportIdx = ai;
+            npc->state = NPC_WALK;
+            npc->wanderTimer = 1.0f + ((float)rand()/RAND_MAX) * 3.0f;
+            npc->wanderYaw   = npc->yaw;
+            npc->stateTimer  = 8.0f + ((float)rand()/RAND_MAX) * 20.0f; // walk for a while before boarding
+            npc->alive = true;
+        }
+    }
+}
+
 // Full terrain + airport pipeline seeded deterministically.
 // Safe to call from the network thread — holds terrainMutex for the duration.
 void generateAllTerrain(unsigned int seed){
@@ -1455,6 +2499,8 @@ void generateAllTerrain(unsigned int seed){
         flattenRect(ap->wx,ap->wz,ap->heading, ap->runwayLen*0.9f, ap->runwayW+50.0f, ap->groundY, 12.0f);
     }
     for(int i=0;i<numAirports;i++) spawnParkedPlanesForAirport(&airports[i]);
+    spawnNpcsForAirports();
+    bakeTerrainColors();
     pthread_mutex_unlock(&terrainMutex);
 }
 
@@ -1836,17 +2882,144 @@ void renderAirport(const Airport *ap){
             glColor3f(0.35f,0.35f,0.35f);
             glBegin(GL_QUADS);
                 glNormal3f(1,0,0);
-                glVertex3f(fwd,      0,   sz);      glVertex3f(fwd+0.06f,0,   sz);
-                glVertex3f(fwd+0.06f,0.5f,sz);      glVertex3f(fwd,      0.5f,sz);
+                glVertex3f(fwd,0,sz); glVertex3f(fwd+0.06f,0,sz);
+                glVertex3f(fwd+0.06f,0.5f,sz); glVertex3f(fwd,0.5f,sz);
             glEnd();
-            // light cap
+            // light lens (solid yellow)
             glColor3f(1.0f,0.92f,0.25f);
             glBegin(GL_QUADS);
                 glNormal3f(0,1,0);
                 glVertex3f(fwd-0.08f,0.52f,sz-0.08f); glVertex3f(fwd+0.14f,0.52f,sz-0.08f);
                 glVertex3f(fwd+0.14f,0.52f,sz+0.08f); glVertex3f(fwd-0.08f,0.52f,sz+0.08f);
             glEnd();
+            // glow halo (additive blend)
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glColor4f(1.0f, 0.85f, 0.1f, 0.35f);
+            float hr = 0.5f;
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(fwd+0.03f, 0.55f, sz);
+                for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
+                    glVertex3f(fwd+0.03f+cosf(ga)*hr, 0.55f+sinf(ga)*hr*0.4f, sz+sinf(ga)*hr); }
+            glEnd();
+            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
         }
+    }
+
+    // ---- Threshold lights (red at each runway end) ----
+    for(int end=-1;end<=1;end+=2){
+        for(int s=-1;s<=1;s+=2){
+            float sz = s*(rw*0.7f);
+            float fx = end*rl;
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glColor4f(1.0f, 0.1f, 0.05f, 0.6f);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(fx, 0.6f, sz);
+                for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
+                    glVertex3f(fx+cosf(ga)*0.5f, 0.6f+sinf(ga)*0.3f, sz+sinf(ga)*0.5f); }
+            glEnd();
+            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+        }
+    }
+
+    // ---- PAPI (Precision Approach Path Indicator) — left side of threshold ----
+    // 4 lights in a row: red/white based on glidepath (just show all as fixed colours)
+    {
+        float papiX = rl - 5.0f;  // near threshold
+        float papiZ = -(rw + 3.5f);
+        for(int p=0;p<4;p++){
+            float pz2 = papiZ - p*2.2f;
+            // alternate red/white to indicate ~3-deg glidepath at centre
+            float pr = (p < 2) ? 1.0f : 0.95f;
+            float pg = (p < 2) ? 0.05f : 0.95f;
+            float pb = (p < 2) ? 0.05f : 0.95f;
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glColor4f(pr, pg, pb, 0.7f);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(papiX, 0.5f, pz2);
+                for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
+                    glVertex3f(papiX+cosf(ga)*0.4f, 0.5f+sinf(ga)*0.25f, pz2+sinf(ga)*0.4f); }
+            glEnd();
+            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+        }
+    }
+
+    // ---- Taxiway edge lights (blue) ----
+    {
+        int ntw = (int)(twEndX*2.0f / 10.0f);
+        for(int l=0;l<=ntw;l++){
+            float fx = -twEndX + l*(twEndX*2.0f/ntw);
+            for(int side=0;side<2;side++){
+                float sz = (side==0) ? twInner-0.3f : twOuter+0.3f;
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glColor4f(0.15f, 0.35f, 1.0f, 0.45f);
+                glBegin(GL_TRIANGLE_FAN);
+                    glVertex3f(fx, 0.4f, sz);
+                    for(int gi=0;gi<=6;gi++){ float ga=gi*6.28318f/6;
+                        glVertex3f(fx+cosf(ga)*0.3f, 0.4f, sz+sinf(ga)*0.3f); }
+                glEnd();
+                glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+            }
+        }
+    }
+
+    // ---- Apron flood lights (bright white on tall poles at apron corners) ----
+    {
+        float floodPoles[4][2] = {
+            {-apronHalfX, apronZ0}, {apronHalfX, apronZ0},
+            {-apronHalfX, apronZ1}, {apronHalfX, apronZ1}
+        };
+        for(int fp=0;fp<4;fp++){
+            float fx = floodPoles[fp][0], fz = floodPoles[fp][1];
+            // Pole
+            glColor3f(0.4f,0.4f,0.4f);
+            glBegin(GL_QUADS);
+                glNormal3f(1,0,0);
+                glVertex3f(fx,0,fz); glVertex3f(fx+0.12f,0,fz);
+                glVertex3f(fx+0.12f,6.5f,fz); glVertex3f(fx,6.5f,fz);
+            glEnd();
+            // Flood glow
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glColor4f(1.0f, 0.97f, 0.88f, 0.30f);
+            glBegin(GL_TRIANGLE_FAN);
+                glVertex3f(fx+0.06f, 6.6f, fz);
+                for(int gi=0;gi<=10;gi++){ float ga=gi*6.28318f/10;
+                    glVertex3f(fx+0.06f+cosf(ga)*1.5f, 6.6f+sinf(ga)*0.5f, fz+sinf(ga)*1.5f); }
+            glEnd();
+            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+        }
+    }
+
+    // ---- Tower rotating beacon (alternating white/green) ----
+    if(ap->size >= 2){
+        float tx2 = apronHalfX + 3.0f;
+        float bz   = bldgZ + 2.0f;
+        float beaconY = 9.2f;
+        // Beacon rotates with world time
+        float beaconAngle = fmodf((float)clock() / (float)CLOCKS_PER_SEC * 2.0f * 3.14159f * 0.5f, 3.14159f*2.0f);
+        float bx2 = tx2 + cosf(beaconAngle)*2.5f;
+        float bz2 = bz  + sinf(beaconAngle)*2.5f;
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+        // White flash
+        glColor4f(1.0f, 1.0f, 1.0f, 0.70f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(tx2, beaconY, bz);
+            for(int gi=0;gi<=10;gi++){ float ga=gi*6.28318f/10;
+                glVertex3f(tx2+cosf(ga)*2.0f, beaconY, bz+sinf(ga)*2.0f); }
+        glEnd();
+        // Green sweep in opposite direction
+        glColor4f(0.0f, 1.0f, 0.2f, 0.50f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(tx2, beaconY, bz);
+            for(int gi=0;gi<=10;gi++){ float ga=gi*6.28318f/10;
+                glVertex3f(bx2+cosf(ga)*1.5f, beaconY, bz2+sinf(ga)*1.5f); }
+        glEnd();
+        glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
     }
 
     glPopMatrix();
@@ -1854,29 +3027,51 @@ void renderAirport(const Airport *ap){
 }
 
 void renderAllAirports(){
-    for(int i=0;i<numAirports;i++) renderAirport(&airports[i]);
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+    for(int i=0;i<numAirports;i++){
+        float dx=airports[i].wx-eyeX, dz=airports[i].wz-eyeZ;
+        if(dx*dx+dz*dz < 1000.0f*1000.0f)
+            renderAirport(&airports[i]);
+    }
 }
 
 void renderTerrain(){
-    float offX=-TERRAIN_SIZE*TERRAIN_SCALE*0.5f;
-    float offZ=-TERRAIN_SIZE*TERRAIN_SCALE*0.5f;
-    glDisable(GL_TEXTURE_2D);
-    // Triangle strips: for each row z, emit vertices alternating between row z and z+1
+    float offX = -TERRAIN_SIZE*TERRAIN_SCALE*0.5f;
+    float offZ = -TERRAIN_SIZE*TERRAIN_SCALE*0.5f;
+    const float invTile = 1.0f/8.0f;
+
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+    int boundBiome = -1;
     for(int z=0;z<TERRAIN_SIZE;z++){
+        int rb  = terrainBiome[z  ][TERRAIN_SIZE/2];
+        int rb1 = terrainBiome[z+1][TERRAIN_SIZE/2];
+        int rowBiome = rb1>rb ? rb1 : rb;
+        if(rowBiome != boundBiome){
+            glBindTexture(GL_TEXTURE_2D, biomeTex[rowBiome]);
+            boundBiome = rowBiome;
+        }
         glBegin(GL_TRIANGLE_STRIP);
         for(int x=0;x<=TERRAIN_SIZE;x++){
-            // vertex on row z+1 first, then row z (standard strip order)
+            float wx  = offX + x*TERRAIN_SCALE;
+            float wz1 = offZ + (z+1)*TERRAIN_SCALE;
+            float wz0 = offZ +  z   *TERRAIN_SCALE;
+            float u   = wx * invTile;
             glNormal3f(terrainNX[z+1][x], terrainNY[z+1][x], terrainNZ[z+1][x]);
-            terrainColor(terrainH[z+1][x], terrainNX[z+1][x], terrainNY[z+1][x], terrainNZ[z+1][x]);
-            glVertex3f(offX+x*TERRAIN_SCALE, terrainH[z+1][x], offZ+(z+1)*TERRAIN_SCALE);
-
+            glColor3ub(terrainCR[z+1][x], terrainCG[z+1][x], terrainCB[z+1][x]);
+            glTexCoord2f(u, wz1*invTile); glVertex3f(wx, terrainH[z+1][x], wz1);
             glNormal3f(terrainNX[z][x], terrainNY[z][x], terrainNZ[z][x]);
-            terrainColor(terrainH[z][x], terrainNX[z][x], terrainNY[z][x], terrainNZ[z][x]);
-            glVertex3f(offX+x*TERRAIN_SCALE, terrainH[z][x], offZ+z*TERRAIN_SCALE);
+            glColor3ub(terrainCR[z][x], terrainCG[z][x], terrainCB[z][x]);
+            glTexCoord2f(u, wz0*invTile); glVertex3f(wx, terrainH[z][x], wz0);
         }
         glEnd();
     }
-    glEnable(GL_TEXTURE_2D);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glDisable(GL_TEXTURE_2D);
 }
 
 // -------- Procedural Ground --------
@@ -1893,6 +3088,156 @@ void generateCheckerboardTexture() {
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,TEX_SIZE,TEX_SIZE,0,GL_RGB,GL_UNSIGNED_BYTE,texData);
+    glBindTexture(GL_TEXTURE_2D,0);
+}
+
+// -------- Biome Detail Textures --------
+// Each texture is 256×256, generated procedurally with layered noise for surface detail.
+// They tile at a fine world-space scale and are modulated with the vertex biome color.
+#define BTEX_SIZE 256
+
+// Simple integer hash for deterministic noise (no srand dependency)
+static float btexNoise(int x, int z, int seed){
+    unsigned int h = (unsigned int)(x*1619 + z*31337 + seed*7919);
+    h ^= h>>16; h *= 0x45d9f3b; h ^= h>>16;
+    return (float)(h & 0xFFFF) / 65535.0f; // [0,1]
+}
+
+// Bilinear smooth noise on the integer grid
+static float btexSmooth(float x, float z, int seed){
+    int ix=(int)floorf(x), iz=(int)floorf(z);
+    float fx=x-ix, fz=z-iz;
+    fx=fx*fx*(3-2*fx); fz=fz*fz*(3-2*fz);
+    float v00=btexNoise(ix,  iz,  seed);
+    float v10=btexNoise(ix+1,iz,  seed);
+    float v01=btexNoise(ix,  iz+1,seed);
+    float v11=btexNoise(ix+1,iz+1,seed);
+    return v00*(1-fx)*(1-fz)+v10*fx*(1-fz)+v01*(1-fx)*fz+v11*fx*fz;
+}
+
+// fBm: sum octaves of smooth noise, returns [0,1]
+static float btexFbm(float x, float z, int octaves, int seed){
+    float val=0, amp=0.5f, freq=1.0f, maxAmp=0;
+    for(int i=0;i<octaves;i++){
+        val += btexSmooth(x*freq, z*freq, seed+i*997)*amp;
+        maxAmp += amp; amp*=0.5f; freq*=2.0f;
+    }
+    return val/maxAmp;
+}
+
+static void generateBiomeTextures(){
+    glGenTextures(NUM_BIOME_TEX, biomeTex);
+    static GLubyte buf[BTEX_SIZE][BTEX_SIZE][3];
+
+    // Helper: upload and set wrap/filter
+#define UPLOAD_TEX(idx) \
+    glBindTexture(GL_TEXTURE_2D, biomeTex[idx]); \
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR); \
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); \
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT); \
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT); \
+    gluBuild2DMipmaps(GL_TEXTURE_2D,GL_RGB,BTEX_SIZE,BTEX_SIZE,GL_RGB,GL_UNSIGNED_BYTE,buf);
+
+    // 0 — Water: deep ocean colour with surface ripple/caustic variation
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*10.0f, fz=z/(float)BTEX_SIZE*10.0f;
+        float coarse = btexFbm(fx,fz,4,1001);
+        // Directional ripple pattern
+        float rip1 = 0.5f+0.5f*sinf(fx*3.1f + coarse*5.0f);
+        float rip2 = 0.5f+0.5f*sinf(fz*2.7f + coarse*4.2f + 1.0f);
+        float ripple = rip1*0.55f + rip2*0.45f;
+        // Shallow highlight from specular blobs
+        float spec2 = btexSmooth(fx*6,fz*6,1099);
+        float highlight = (spec2 > 0.78f) ? (spec2-0.78f)*3.5f : 0.0f;
+        float depth = 0.30f + coarse*0.10f + ripple*0.08f;
+        buf[z][x][0]=(unsigned char)clampf((depth*0.30f + highlight*0.40f)*255,0,255);
+        buf[z][x][1]=(unsigned char)clampf((depth*0.55f + highlight*0.50f)*255,0,255);
+        buf[z][x][2]=(unsigned char)clampf((depth*0.95f + highlight*0.70f)*255,0,255);
+    }
+    UPLOAD_TEX(0)
+
+    // 1 — Sand/Dirt: warm dune texture with fine grain and shadow pockets
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*20.0f, fz=z/(float)BTEX_SIZE*20.0f;
+        float macro = btexFbm(fx*0.5f,fz*0.5f,5,2001); // large dune shape
+        float grain = btexFbm(fx,fz,6,2003);             // fine grain
+        float pebble= btexFbm(fx*2,fz*2,4,2099);         // medium pebble
+        // Small shadow pockets (darkening in hollows)
+        float pocket = (pebble < 0.38f) ? (0.38f-pebble)*0.6f : 0.0f;
+        float v = 0.68f + macro*0.18f + grain*0.10f - pocket;
+        // Warm sandy colour with slight reddish tint at lower spots
+        float rTint = 1.0f + macro*0.08f;
+        buf[z][x][0]=(unsigned char)clampf(v*rTint*195,0,255);
+        buf[z][x][1]=(unsigned char)clampf(v*168,0,255);
+        buf[z][x][2]=(unsigned char)clampf(v*112,0,255);
+    }
+    UPLOAD_TEX(1)
+
+    // 2 — Grass: multi-layer with micro-blades, dry patches, and soil showing through
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*14.0f, fz=z/(float)BTEX_SIZE*14.0f;
+        float macro = btexFbm(fx*0.4f,fz*0.4f,4,3001);   // large patches
+        float mid   = btexFbm(fx,fz,5,3007);              // medium texture
+        // Fine grass blade streaks — anisotropic (taller in z)
+        float blade = btexSmooth(fx*10,fz*2.5f,3101)*btexSmooth(fx*10,fz*2.8f,3203)*0.22f;
+        // Bare soil shows through in sparse patches
+        float sparse= btexFbm(fx*1.5f,fz*1.5f,4,3301);
+        float soilAmt= (sparse < 0.32f) ? (0.32f-sparse)*1.2f : 0.0f;
+        float v = 0.62f + macro*0.20f + mid*0.12f + blade;
+        // Lerp between green and brown (soil)
+        float green_r = v*72,  green_g = v*145, green_b = v*50;
+        float soil_r  = v*110, soil_g  = v*88,  soil_b  = v*55;
+        buf[z][x][0]=(unsigned char)clampf(green_r*(1-soilAmt)+soil_r*soilAmt,0,255);
+        buf[z][x][1]=(unsigned char)clampf(green_g*(1-soilAmt)+soil_g*soilAmt,0,255);
+        buf[z][x][2]=(unsigned char)clampf(green_b*(1-soilAmt)+soil_b*soilAmt,0,255);
+    }
+    UPLOAD_TEX(2)
+
+    // 3 — Rock: weathered granite with cracks, lichen stains, and facets
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*12.0f, fz=z/(float)BTEX_SIZE*12.0f;
+        float base  = btexFbm(fx,fz,7,4013);
+        // Ridge lines — invert fBm for ridge-like crags
+        float ridge = 1.0f - fabsf(btexFbm(fx*1.5f,fz*1.5f,5,4099)*2-1);
+        ridge = ridge*ridge; // sharpen
+        // Crack network
+        float crack1 = fabsf(btexFbm(fx*3,fz*0.5f,4,4201)*2-1);
+        float crack2 = fabsf(btexFbm(fx*0.5f,fz*3,4,4301)*2-1);
+        float crack  = 1.0f - clampf((crack1<crack2?crack1:crack2)*4.0f,0,1);
+        // Lichen: greenish patches at lower spots
+        float lichen = btexFbm(fx*0.7f,fz*0.7f,4,4401);
+        float lichenAmt = (lichen > 0.62f) ? (lichen-0.62f)*1.5f : 0.0f;
+        float v = 0.42f + base*0.32f + ridge*0.14f - crack*0.15f;
+        float lr = v*188, lg = v*178, lb = v*165; // grey stone
+        float lichenR=v*80, lichenG=v*140, lichenB=v*70;
+        buf[z][x][0]=(unsigned char)clampf(lr*(1-lichenAmt)+lichenR*lichenAmt,0,255);
+        buf[z][x][1]=(unsigned char)clampf(lg*(1-lichenAmt)+lichenG*lichenAmt,0,255);
+        buf[z][x][2]=(unsigned char)clampf(lb*(1-lichenAmt)+lichenB*lichenAmt,0,255);
+    }
+    UPLOAD_TEX(3)
+
+    // 4 — Snow: compressed ice with subsurface blue tint, sparkle, and wind-blown ridges
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*8.0f, fz=z/(float)BTEX_SIZE*8.0f;
+        float base  = btexFbm(fx,fz,5,5003);
+        // Wind-blown ridges (anisotropic in x)
+        float windR = btexSmooth(fx*0.8f,fz*4.0f,5101)*0.15f;
+        // Fine sparkle
+        float sp = btexSmooth(fx*22,fz*22,5201);
+        float sparkle = (sp>0.88f)?(sp-0.88f)*7.0f:0.0f;
+        // Shadow between ridges
+        float shadow = btexFbm(fx*2,fz*2,4,5301)*0.10f;
+        float v = 0.80f + base*0.12f + windR - shadow;
+        float vS = v + sparkle*0.22f;
+        // Blue subsurface tint in deep areas
+        float depthAmt = clampf(1.0f-base*2.0f, 0.0f, 0.3f);
+        buf[z][x][0]=(unsigned char)clampf(vS*235*(1-depthAmt)+vS*180*depthAmt,0,255);
+        buf[z][x][1]=(unsigned char)clampf(vS*240*(1-depthAmt)+vS*210*depthAmt,0,255);
+        buf[z][x][2]=(unsigned char)clampf(vS*255,0,255);
+    }
+    UPLOAD_TEX(4)
+
+#undef UPLOAD_TEX
     glBindTexture(GL_TEXTURE_2D,0);
 }
 
@@ -1976,7 +3321,19 @@ void* networkThreadFunc(void* arg){
             } else if(*recvType==MSG_EXPLOSION && n==(int)(sizeof(int)+sizeof(float)*4)){
                 float *ed=(float*)(buffer+sizeof(int));
                 receiveExplosion(ed[0],ed[1],ed[2],ed[3]);
-                // Server relays explosion to all other clients
+                if(isServer && clientConnected)
+                    sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
+            } else if(*recvType==MSG_VOICE && n>(int)VOICE_HDR){
+                voiceReceive(buffer, n);
+                if(isServer && clientConnected)
+                    sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
+            } else if(*recvType==MSG_CHAT && n>=(int)(sizeof(int)+1)){
+                char msgbuf[CHAT_MSG_LEN+8];
+                const char *raw = buffer+sizeof(int);
+                int rawlen = n-sizeof(int);
+                if(rawlen >= CHAT_MSG_LEN) rawlen = CHAT_MSG_LEN-1;
+                snprintf(msgbuf, sizeof(msgbuf), "[remote] %.*s", rawlen, raw);
+                chatAddMsg(msgbuf);
                 if(isServer && clientConnected)
                     sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
             }
@@ -2098,22 +3455,16 @@ void updateWeather(float dt){
         float tR,tG,tB,tFog,tRain,tWX,tWZ;
         weatherPreset(newType,&tR,&tG,&tB,&tFog,&tRain,&tWX,&tWZ);
         float sp = dt * weather.transitionSpeed;
-        weather.skyR += (tR - weather.skyR)*sp*60;
-        weather.skyG += (tG - weather.skyG)*sp*60;
-        weather.skyB += (tB - weather.skyB)*sp*60;
         weather.fogDensity    += (tFog  - weather.fogDensity)*sp*60;
         weather.rainIntensity += (tRain - weather.rainIntensity)*sp*60;
         weather.windX += (tWX - weather.windX)*sp*60;
         weather.windZ += (tWZ - weather.windZ)*sp*60;
         weather.transitionTimer = 20.0f + ((float)rand()/RAND_MAX)*80.0f;
     }
-    // Smooth per-frame lerp toward current targets
+    // Smooth per-frame lerp toward current targets (sky colour driven by updateSunLight)
     float sp = dt * 0.15f;
     float tR,tG,tB,tFog,tRain,tWX,tWZ;
     weatherPreset(weather.type,&tR,&tG,&tB,&tFog,&tRain,&tWX,&tWZ);
-    weather.skyR += (tR - weather.skyR)*sp;
-    weather.skyG += (tG - weather.skyG)*sp;
-    weather.skyB += (tB - weather.skyB)*sp;
     weather.fogDensity    += (tFog  - weather.fogDensity)*sp;
     weather.rainIntensity += (tRain - weather.rainIntensity)*sp;
     weather.windX += (tWX - weather.windX)*sp;
@@ -2201,6 +3552,12 @@ static void renderExplosions(){
         float cy = explosions[i].y;
         float cz = explosions[i].z;
 
+        // Pre-compute t-dependent values shared across all particles of this explosion
+        float one_minus_t = 1.0f - t;
+        float rise_factor0 = (1.0f - one_minus_t*one_minus_t);
+        float rise_factor1 = rise_factor0;
+
+        glBegin(GL_QUADS);
         for(int p=0;p<EXPLOSION_PARTICLES;p++){
             float spd  = explosions[i].ps[p];
             int   type = explosions[i].pt[p];
@@ -2213,7 +3570,7 @@ static void renderExplosions(){
 
             if(type == 0){
                 // ── Stem: rises quickly, smaller spread ──
-                float rise = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 6.0f;
+                float rise = spd * rise_factor0 * 6.0f;
                 px = cx + dirX * rise;
                 py = cy + dirY * rise;
                 pz = cz + dirZ * rise;
@@ -2229,8 +3586,9 @@ static void renderExplosions(){
 
             } else if(type == 1){
                 // ── Cap: arc up then curl outward, tighter radius ──
-                float rise   = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 5.0f;
-                float spread = (t > 0.2f) ? spd * ((t-0.2f)/0.8f) * ((t-0.2f)/0.8f) * 7.0f : 0.0f;
+                float rise   = spd * rise_factor1 * 5.0f;
+                float tAdj   = (t > 0.2f) ? (t-0.2f)*(1.0f/0.8f) : 0.0f;
+                float spread = (t > 0.2f) ? spd * tAdj * tAdj * 7.0f : 0.0f;
                 px = cx + dirX * (rise + spread);
                 py = cy + dirY * rise;
                 pz = cz + dirZ * (rise + spread);
@@ -2246,7 +3604,7 @@ static void renderExplosions(){
 
             } else if(type == 2){
                 // ── Base ring: low radial blast, tighter ──
-                float ring = spd * (1.0f - (1.0f-t)*(1.0f-t)) * 6.0f;
+                float ring = spd * rise_factor0 * 6.0f;
                 px = cx + dirX * ring;
                 py = cy + dirY * ring * 0.3f;
                 pz = cz + dirZ * ring;
@@ -2277,13 +3635,12 @@ static void renderExplosions(){
             }
 
             glColor4f(r,g,b,a);
-            glBegin(GL_QUADS);
             glVertex3f(px-sz, py-sz, pz);
             glVertex3f(px+sz, py-sz, pz);
             glVertex3f(px+sz, py+sz, pz);
             glVertex3f(px-sz, py+sz, pz);
-            glEnd();
         }
+        glEnd();
     }
 
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2369,29 +3726,30 @@ static void renderTornado(Tornado *t){
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // Funnel: wide at top (cloud base), narrow tip at ground — classic tornado shape
+    // Pre-compute per-point angle steps to avoid repeated division inside the loop
+    float invPts = 1.0f / pts;
+    float twoPi  = 2.0f * (float)M_PI;
     for(int r=0; r<rings; r++){
-        float frac  = (float)r/(rings-1);          // 0=ground tip, 1=top cloud
-        float y     = gndY + frac * maxH;
-        float radius= 1.0f + frac*frac * 9.0f;     // ~1 at tip, ~10 at top
-        float phase = t->angle + frac * 6.0f;       // helix twist
-        float alpha = 0.12f + frac*0.30f;           // denser at top
-
-        // Colour: dark at tip, lighter/greyer toward cloud
+        float frac  = (float)r/(rings-1);
+        float frac1 = (r+1 < rings) ? (float)(r+1)/(rings-1) : 1.0f;
+        float y     = gndY + frac  * maxH;
+        float y1    = gndY + frac1 * maxH;
+        float radius= 1.0f + frac *frac  * 9.0f;
+        float r1    = 1.0f + frac1*frac1 * 9.0f;
+        float phase = t->angle + frac  * 6.0f;
+        float ph1   = t->angle + frac1 * 6.0f;
+        float alpha = 0.12f + frac*0.30f;
         float rv = 0.20f + frac*0.35f;
         float gv = 0.18f + frac*0.28f;
         float bv = 0.18f + frac*0.28f;
         glColor4f(rv,gv,bv,alpha);
-
         glBegin(GL_TRIANGLE_STRIP);
         for(int p=0; p<=pts; p++){
-            float a  = phase + (float)p/pts * 2.0f*(float)M_PI;
-            float frac1 = (r+1 < rings) ? (float)(r+1)/(rings-1) : 1.0f;
-            float r1 = 1.0f + frac1*frac1 * 9.0f;
-            float y1 = gndY + frac1 * maxH;
-            float ph1= t->angle + frac1 * 6.0f;
-            float a1 = ph1 + (float)p/pts * 2.0f*(float)M_PI;
-            glVertex3f(t->x + cosf(a)*radius, y,  t->z + sinf(a)*radius);
-            glVertex3f(t->x + cosf(a1)*r1,    y1, t->z + sinf(a1)*r1);
+            float step = (float)p * invPts * twoPi;
+            float a    = phase + step;
+            float a1   = ph1   + step;
+            glVertex3f(t->x + cosf(a )*radius, y,  t->z + sinf(a )*radius);
+            glVertex3f(t->x + cosf(a1)*r1,     y1, t->z + sinf(a1)*r1);
         }
         glEnd();
     }
@@ -2622,41 +3980,781 @@ static void renderMap(){
 #undef W2MY
 }
 
-static void renderDiveBombers();
+// -------- Trees --------
+static void initTrees(){
+    numTrees = 0;
+    float halfW = TERRAIN_SIZE * TERRAIN_SCALE * 0.5f;
+    srand(terrainSeed ^ 0x7EEDBABE);
+    int attempts = MAX_TREES * 6;
+    while(numTrees < MAX_TREES && attempts-- > 0){
+        float tx = ((float)rand()/RAND_MAX*2.0f-1.0f)*halfW;
+        float tz = ((float)rand()/RAND_MAX*2.0f-1.0f)*halfW;
+        float h  = terrainHeightAt(tx, tz);
+
+        // Skip water, mountain tops, near airports
+        int gx = (int)((tx/TERRAIN_SCALE) + TERRAIN_SIZE/2.0f);
+        int gz = (int)((tz/TERRAIN_SCALE) + TERRAIN_SIZE/2.0f);
+        gx = gx<0?0:(gx>TERRAIN_SIZE?TERRAIN_SIZE:gx);
+        gz = gz<0?0:(gz>TERRAIN_SIZE?TERRAIN_SIZE:gz);
+        int biome = terrainBiome[gz][gx];
+        if(biome == 0 || biome == 4) continue; // skip water & snow
+        if(h > TERRAIN_HEIGHT * 0.65f) continue;
+
+        // Skip near airports
+        bool nearAirport = false;
+        for(int ai=0;ai<numAirports;ai++){
+            float adx=tx-airports[ai].wx, adz=tz-airports[ai].wz;
+            if(adx*adx+adz*adz < 80.0f*80.0f){ nearAirport=true; break; }
+        }
+        if(nearAirport) continue;
+
+        Tree *t = &trees[numTrees++];
+        t->x = tx; t->z = tz; t->y = h;
+        t->h = 3.5f + (float)rand()/RAND_MAX * 5.0f;
+        t->r = t->h * 0.45f;
+        // Variant by biome: grass/highland=oak(1), sand=palm(2), rock=pine(0)
+        if(biome == 1)       t->variant = 2; // palm for sand
+        else if(biome == 3)  t->variant = 0; // pine for highland/rock
+        else                 t->variant = 1; // oak for grass
+    }
+    srand((unsigned)time(NULL));
+}
+
+static void renderTrees(){
+    if(numTrees == 0) return;
+
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+
+    // Get camera right/up for billboarding
+    float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    float rx = mv[0], rz = mv[8]; // right vector X and Z (ignore Y for upright trees)
+
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    for(int i = 0; i < numTrees; i++){
+        Tree *t = &trees[i];
+        float dx = t->x - eyeX, dz = t->z - eyeZ;
+        float d2 = dx*dx + dz*dz;
+        if(d2 > 500.0f*500.0f) continue;
+
+        float fade = 1.0f;
+        if(d2 > 400.0f*400.0f) fade = 1.0f - (sqrtf(d2)-400.0f)/100.0f;
+
+        // Trunk
+        glColor3f(0.38f, 0.25f, 0.14f);
+        float tx2 = t->x, ty = t->y, tz2 = t->z;
+        float trunkH = t->h * 0.40f;
+        float trunkR = t->r * 0.12f;
+        glBegin(GL_QUADS);
+            glNormal3f(rx, 0, rz);
+            glVertex3f(tx2 - rx*trunkR, ty,           tz2 - rz*trunkR);
+            glVertex3f(tx2 + rx*trunkR, ty,           tz2 + rz*trunkR);
+            glVertex3f(tx2 + rx*trunkR, ty + trunkH,  tz2 + rz*trunkR);
+            glVertex3f(tx2 - rx*trunkR, ty + trunkH,  tz2 - rz*trunkR);
+        glEnd();
+
+        // Canopy — variant colours
+        float cr, cg, cb;
+        if(t->variant == 0){ cr=0.18f; cg=0.42f; cb=0.15f; } // pine: dark green
+        else if(t->variant==1){ cr=0.22f; cg=0.52f; cb=0.18f; } // oak: medium green
+        else { cr=0.38f; cg=0.58f; cb=0.12f; } // palm: yellow-green
+
+        glColor4f(cr, cg, cb, fade);
+
+        if(t->variant == 0){
+            // Pine: 3 stacked triangular layers
+            for(int layer = 0; layer < 3; layer++){
+                float ly0 = ty + trunkH + layer * t->h * 0.20f;
+                float ly1 = ly0 + t->h * 0.40f;
+                float lr  = t->r * (1.0f - layer * 0.28f);
+                // Two crossed quads
+                for(int cross=0; cross<2; cross++){
+                    float ax = (cross==0) ? rx : rz;
+                    float az = (cross==0) ? rz : -rx;
+                    glBegin(GL_TRIANGLES);
+                        glNormal3f(0,0,1);
+                        glVertex3f(tx2 - ax*lr, ly0, tz2 - az*lr);
+                        glVertex3f(tx2 + ax*lr, ly0, tz2 + az*lr);
+                        glVertex3f(tx2,          ly1, tz2);
+                    glEnd();
+                }
+            }
+        } else if(t->variant == 1){
+            // Oak: round puff — crossed billboard quads
+            float cy2 = ty + trunkH + t->r * 0.6f;
+            float lr = t->r;
+            for(int cross=0; cross<2; cross++){
+                float ax = (cross==0) ? rx : rz;
+                float az = (cross==0) ? rz : -rx;
+                glBegin(GL_QUADS);
+                    glNormal3f(0,0,1);
+                    glVertex3f(tx2 - ax*lr, cy2 - lr*0.7f, tz2 - az*lr);
+                    glVertex3f(tx2 + ax*lr, cy2 - lr*0.7f, tz2 + az*lr);
+                    glVertex3f(tx2 + ax*lr, cy2 + lr*0.7f, tz2 + az*lr);
+                    glVertex3f(tx2 - ax*lr, cy2 + lr*0.7f, tz2 - az*lr);
+                glEnd();
+            }
+        } else {
+            // Palm: fan of fronds at top
+            float topY = ty + t->h;
+            float trunkMidX = tx2, trunkMidZ = tz2;
+            // Straight trunk (billboard)
+            glColor4f(0.55f, 0.42f, 0.22f, fade);
+            glBegin(GL_QUADS);
+                glVertex3f(trunkMidX - rx*trunkR*1.5f, ty,      trunkMidZ - rz*trunkR*1.5f);
+                glVertex3f(trunkMidX + rx*trunkR*1.5f, ty,      trunkMidZ + rz*trunkR*1.5f);
+                glVertex3f(trunkMidX + rx*trunkR*0.8f, topY,    trunkMidZ + rz*trunkR*0.8f);
+                glVertex3f(trunkMidX - rx*trunkR*0.8f, topY,    trunkMidZ - rz*trunkR*0.8f);
+            glEnd();
+            // Fronds (6 drooping blades)
+            glColor4f(cr, cg, cb, fade);
+            for(int f=0; f<6; f++){
+                float fa = f * 3.14159f * 2.0f / 6.0f;
+                float fx2 = cosf(fa)*t->r, fz2 = sinf(fa)*t->r;
+                glBegin(GL_TRIANGLES);
+                    glNormal3f(0,1,0);
+                    glVertex3f(tx2,        topY,         tz2);
+                    glVertex3f(tx2+fx2,    topY-t->r*0.4f, tz2+fz2);
+                    glVertex3f(tx2+fx2*0.6f, topY+0.5f,  tz2+fz2*0.6f);
+                glEnd();
+            }
+        }
+    }
+
+    glDisable(GL_BLEND);
+}
+
+// -------- Clouds --------
+static void initClouds(){
+    numClouds = 0;
+    float halfW = TERRAIN_SIZE * TERRAIN_SCALE * 0.5f;
+    srand(terrainSeed ^ 0xC1A3D5);
+    for(int i = 0; i < MAX_CLOUDS; i++){
+        Cloud *c = &clouds[numClouds++];
+        c->x = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * halfW;
+        c->z = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * halfW;
+        // Layer clouds between altitudes based on weather
+        c->y = 60.0f + (float)rand()/RAND_MAX * 80.0f;
+        c->r = 18.0f + (float)rand()/RAND_MAX * 40.0f;
+        c->brightness = 0.78f + (float)rand()/RAND_MAX * 0.22f;
+    }
+    srand((unsigned)time(NULL)); // restore proper random state
+}
+
+static void renderClouds(){
+    if(numClouds == 0) return;
+
+    // Get camera right/up vectors from modelview matrix for billboarding
+    float mv[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    float rx = mv[0], ry = mv[4], rz = mv[8];  // right vector (column 0)
+    float ux = mv[1], uy = mv[5], uz = mv[9];  // up vector (column 1)
+
+    float camX = inPlane ? player.x : walkerX;
+    float camY = inPlane ? player.y : walkerY;
+    float camZ = inPlane ? player.z : walkerZ;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST);
+
+    // Each cloud = cluster of 5 spherical billboard quads
+    static const float offsets[5][3] = {
+        { 0.0f,  0.0f, 0.0f},
+        { 0.7f,  0.3f, 0.0f},
+        {-0.6f,  0.4f, 0.0f},
+        { 0.2f, -0.5f, 0.0f},
+        {-0.3f, -0.4f, 0.0f},
+    };
+
+    for(int i = 0; i < numClouds; i++){
+        Cloud *c = &clouds[i];
+        // Cull distant clouds
+        float dx = c->x - camX, dy = c->y - camY, dz = c->z - camZ;
+        if(dx*dx + dy*dy + dz*dz > 900.0f*900.0f) continue;
+
+        // Fade alpha by distance & weather
+        float dist2 = dx*dx + dz*dz;
+        float alpha = 0.55f * (1.0f - dist2/(900.0f*900.0f));
+        // More opaque in overcast
+        if(weather.type == WX_OVERCAST || weather.type == WX_STORM)
+            alpha = fminf(alpha * 1.6f, 0.82f);
+
+        float b = c->brightness;
+        // Darken under storm
+        if(weather.type == WX_STORM) b *= 0.55f;
+        else if(weather.type == WX_OVERCAST) b *= 0.72f;
+        glColor4f(b, b, b*0.97f, alpha);
+
+        for(int p = 0; p < 5; p++){
+            float px = c->x + offsets[p][0] * c->r * 0.9f;
+            float py = c->y + offsets[p][1] * c->r * 0.5f;
+            float pz = c->z + offsets[p][2] * c->r * 0.9f;
+            float pr = c->r * (0.7f + offsets[p][1] * 0.25f);
+
+            // Billboard quad
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(px, py, pz);
+            for(int j = 0; j <= 8; j++){
+                float a = j * 3.14159f * 2.0f / 8.0f;
+                float ca = cosf(a) * pr, sa = sinf(a) * pr;
+                glVertex3f(px + rx*ca + ux*sa,
+                           py + ry*ca + uy*sa,
+                           pz + rz*ca + uz*sa);
+            }
+            glEnd();
+        }
+    }
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+    glDisable(GL_BLEND);
+}
+
+// -------- Sky / Sun --------
+// Returns sky RGB and sun direction for given gameTime [0,1)
+static void skyColorsForTime(float t,
+                              float *skyR, float *skyG, float *skyB,
+                              float *horizR, float *horizG, float *horizB,
+                              float *sunElevDeg, float *sunAzimDeg){
+    // t: 0=midnight, 0.25=6am dawn, 0.5=noon, 0.75=6pm dusk, 1=midnight
+    float ang = t * 2.0f * (float)M_PI;  // sun azimuth circles around
+    *sunAzimDeg  = t * 360.0f;
+    *sunElevDeg  = sinf(ang) * 90.0f;    // +90 at noon, -90 at midnight
+
+    float elev01 = (*sunElevDeg + 90.0f) / 180.0f; // 0=nadir, 0.5=horizon, 1=zenith
+    float dayF   = (*sunElevDeg > 0.0f) ? (*sunElevDeg / 90.0f) : 0.0f;
+    float dawnF  = 1.0f - fabsf(*sunElevDeg / 18.0f);
+    if(dawnF < 0.0f) dawnF = 0.0f;
+
+    // Zenith colour
+    *skyR = 0.08f + dayF * 0.42f;
+    *skyG = 0.12f + dayF * 0.56f;
+    *skyB = 0.22f + dayF * 0.68f;
+
+    // Horizon colour (warm at dawn/dusk, pale blue at noon, dark at night)
+    *horizR = 0.10f + dayF*0.60f + dawnF*0.50f;
+    *horizG = 0.10f + dayF*0.55f + dawnF*0.15f;
+    *horizB = 0.15f + dayF*0.50f - dawnF*0.10f;
+    if(*horizB < 0.0f) *horizB = 0.0f;
+}
+
+static void updateSunLight(){
+    float skyR, skyG, skyB, horizR, horizG, horizB, elevDeg, azimDeg;
+    skyColorsForTime(gameTime, &skyR,&skyG,&skyB, &horizR,&horizG,&horizB, &elevDeg, &azimDeg);
+
+    float elevRad = elevDeg * (float)M_PI / 180.0f;
+    float azimRad = azimDeg * (float)M_PI / 180.0f;
+    float lx = -sinf(azimRad)*cosf(elevRad);
+    float ly =  sinf(elevRad);
+    float lz = -cosf(azimRad)*cosf(elevRad);
+
+    GLfloat lpos[4] = { lx, ly, lz, 0.0f };
+    glLightfv(GL_LIGHT0, GL_POSITION, lpos);
+
+    float dayF = (elevDeg > 0.0f) ? (elevDeg / 90.0f) : 0.0f;
+    float dawnF = 1.0f - fabsf(elevDeg / 18.0f); if(dawnF<0)dawnF=0;
+
+    GLfloat amb[4]  = { 0.05f+dayF*0.20f,  0.05f+dayF*0.20f,  0.08f+dayF*0.22f,  1.0f };
+    GLfloat diff[4] = { 0.50f+dayF*0.50f+dawnF*0.30f,
+                        0.45f+dayF*0.45f,
+                        0.35f+dayF*0.45f, 1.0f };
+    GLfloat spec[4] = { diff[0]*0.7f, diff[1]*0.7f, diff[2]*0.7f, 1.0f };
+    glLightfv(GL_LIGHT0, GL_AMBIENT,  amb);
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  diff);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, spec);
+
+    // Blend time-of-day horizon colour with weather (weather darkens/greys the sky)
+    // weatherFactor: 0=clear, 1=storm (from fog density proxy)
+    float wf = clampf(weather.fogDensity / 0.007f, 0.0f, 1.0f);
+    float baseR = horizR*(1.0f-wf) + (horizR*0.4f+0.1f)*wf;
+    float baseG = horizG*(1.0f-wf) + (horizG*0.4f+0.1f)*wf;
+    float baseB = horizB*(1.0f-wf) + (horizB*0.4f+0.15f)*wf;
+    weather.skyR = baseR;
+    weather.skyG = baseG;
+    weather.skyB = baseB;
+    glClearColor(weather.skyR, weather.skyG, weather.skyB, 1.0f);
+    // Update fog colour too
+    GLfloat fogCol[4] = {weather.skyR, weather.skyG, weather.skyB, 1.0f};
+    glFogfv(GL_FOG_COLOR, fogCol);
+}
+
+static void renderSkyDome(float camX, float camY, float camZ){
+    float skyR, skyG, skyB, horizR, horizG, horizB, elevDeg, azimDeg;
+    skyColorsForTime(gameTime, &skyR,&skyG,&skyB, &horizR,&horizG,&horizB, &elevDeg, &azimDeg);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_FOG);
+
+    glPushMatrix();
+    glTranslatef(camX, camY, camZ);
+
+    // Draw sky as a large hemisphere of quads (zenith=skyRGB, horizon=horizRGB)
+    const int stacks=8, slices=16;
+    const float R = 900.0f;
+    for(int s=0; s<stacks; s++){
+        float a0 = (float)s     / stacks * (float)M_PI * 0.5f;  // 0..pi/2
+        float a1 = (float)(s+1) / stacks * (float)M_PI * 0.5f;
+        float t0 = (float)s     / stacks;  // 0=horizon, 1=zenith
+        float t1 = (float)(s+1) / stacks;
+        // Lerp colours
+        float r0=horizR+(skyR-horizR)*t0, g0=horizG+(skyG-horizG)*t0, b0=horizB+(skyB-horizB)*t0;
+        float r1=horizR+(skyR-horizR)*t1, g1=horizG+(skyG-horizG)*t1, b1=horizB+(skyB-horizB)*t1;
+        glBegin(GL_TRIANGLE_STRIP);
+        for(int sl=0; sl<=slices; sl++){
+            float phi = (float)sl / slices * 2.0f * (float)M_PI;
+            float cp = cosf(phi), sp2 = sinf(phi);
+            glColor3f(r1,g1,b1);
+            glVertex3f(cp*cosf(a1)*R, sinf(a1)*R, sp2*cosf(a1)*R);
+            glColor3f(r0,g0,b0);
+            glVertex3f(cp*cosf(a0)*R, sinf(a0)*R, sp2*cosf(a0)*R);
+        }
+        glEnd();
+    }
+    // Below horizon: fill with horizon colour
+    glColor3f(horizR, horizG, horizB);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex3f(0,-R,0);
+    for(int sl=0;sl<=slices;sl++){
+        float phi = (float)sl/slices*2.0f*(float)M_PI;
+        glVertex3f(cosf(phi)*R, 0, sinf(phi)*R);
+    }
+    glEnd();
+
+    // Sun disc (only when above horizon)
+    if(elevDeg > -5.0f){
+        float elevRad = elevDeg * (float)M_PI / 180.0f;
+        float azimRad = azimDeg * (float)M_PI / 180.0f;
+        float sx = -sinf(azimRad)*cosf(elevRad)*0.98f*R;
+        float sy =  sinf(elevRad)*0.98f*R;
+        float sz = -cosf(azimRad)*cosf(elevRad)*0.98f*R;
+        float dayF = (elevDeg>0)?(elevDeg/90.0f):0.0f;
+        float dawnF2 = 1.0f-fabsf(elevDeg/15.0f); if(dawnF2<0)dawnF2=0;
+        glBegin(GL_TRIANGLE_FAN);
+        glColor3f(1.0f, 0.95f+dawnF2*0.05f-dayF*0.05f, 0.60f+dayF*0.35f);
+        glVertex3f(sx, sy, sz);
+        glColor3f(horizR*1.4f, horizG*1.1f, horizB*0.7f);
+        float sunR = 40.0f;
+        // two tangent vectors perpendicular to sun direction
+        float len = sqrtf(sx*sx+sy*sy+sz*sz);
+        float ux,uy,uz;
+        if(fabsf(sy/len) < 0.9f){ ux=0;uy=1;uz=0; }
+        else { ux=1;uy=0;uz=0; }
+        float tx = uy*(sz/len)-uz*(sy/len), ty = uz*(sx/len)-ux*(sz/len), tz = ux*(sy/len)-uy*(sx/len);
+        float bx = (sy/len)*tz-(sz/len)*ty, by=(sz/len)*tx-(sx/len)*tz, bz=(sx/len)*ty-(sy/len)*tx;
+        for(int k=0;k<=16;k++){
+            float a = (float)k/16*2.0f*(float)M_PI;
+            glVertex3f(sx+(tx*cosf(a)+bx*sinf(a))*sunR,
+                       sy+(ty*cosf(a)+by*sinf(a))*sunR,
+                       sz+(tz*cosf(a)+bz*sinf(a))*sunR);
+        }
+        glEnd();
+    }
+
+    glPopMatrix();
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+    glEnable(GL_FOG);
+}
+
+// -------- Cockpit View --------
+// Geometry units: 1 unit ≈ cockpit width. Dashboard sits at z ≈ -1.4 so
+// there's plenty of forward FOV. Panel top edge is at y ≈ -0.38 (below horizon).
+static void renderCockpit(){
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_FOG);
+    glEnable(GL_DEPTH_TEST);  // use depth so panel occludes stick etc.
+    glClear(GL_DEPTH_BUFFER_BIT);  // fresh depth for cockpit layer
+
+    // sun-side ambient tint to simulate light coming through canopy
+    float dayF2 = clampf(sinf(gameTime*2.0f*(float)M_PI), 0.0f, 1.0f);
+    float ambR = 0.10f + dayF2*0.18f;
+    float ambG = 0.10f + dayF2*0.14f;
+    float ambB = 0.12f + dayF2*0.10f;
+
+    // helper: quad with simple vertical shading to fake AO
+#define CPANEL_QUAD(x0,y0,z0, x1,y1,z1, x2,y2,z2, x3,y3,z3, r,g,b) \
+    glBegin(GL_QUADS); \
+    glColor3f((r)*0.75f,(g)*0.75f,(b)*0.75f); glVertex3f(x0,y0,z0); \
+    glColor3f((r)*0.75f,(g)*0.75f,(b)*0.75f); glVertex3f(x1,y1,z1); \
+    glColor3f((r),(g),(b));                    glVertex3f(x2,y2,z2); \
+    glColor3f((r),(g),(b));                    glVertex3f(x3,y3,z3); \
+    glEnd();
+
+    if(player.type == PLANE_FIGHTER){
+        // ---- F/A-18 Hornet cockpit ----
+        // Dashboard — far back, low on screen
+        float pz  = -1.40f;   // panel face Z
+        float pzt = -1.20f;   // panel top (tilted toward pilot)
+        float pt  = -0.38f;   // top edge Y
+        float pb  = -0.85f;   // bottom edge Y
+        float pw  =  0.62f;   // half-width
+        CPANEL_QUAD(-pw,pb,pz, pw,pb,pz, pw,pt,pzt, -pw,pt,pzt, 0.09f,0.09f,0.11f)
+
+        // Glareshield (thin shelf above panel, deep black, cuts horizon slightly)
+        float gz = -1.15f;
+        CPANEL_QUAD(-pw,pt,pzt, pw,pt,pzt, pw,pt+0.04f,gz, -pw,pt+0.04f,gz, 0.05f,0.05f,0.06f)
+
+        // Canopy frame — thin side bows, far enough not to block view
+        float cbz0 = -0.60f, cbz1 = -2.50f;
+        float cby0 = -0.10f, cby1 =  0.55f;
+        float cbx  =  0.68f, cbt  =  0.04f; // x position and thickness
+        // Left bow
+        CPANEL_QUAD(-cbx,cby0,cbz0, -cbx+cbt,cby0,cbz0, -cbx+cbt,cby1,cbz1, -cbx,cby1,cbz1, 0.14f,0.14f,0.16f)
+        // Right bow
+        CPANEL_QUAD( cbx-cbt,cby0,cbz0,  cbx,cby0,cbz0,  cbx,cby1,cbz1,  cbx-cbt,cby1,cbz1, 0.14f,0.14f,0.16f)
+        // Top arch bar (very thin)
+        CPANEL_QUAD(-cbx,cby1-0.025f,cbz1, cbx,cby1-0.025f,cbz1, cbx,cby1,cbz1, -cbx,cby1,cbz1, 0.12f,0.12f,0.14f)
+
+        // Cockpit side walls (dark grey inside fuselage)
+        CPANEL_QUAD(-cbx,pb,cbz0, -cbx,pt,cbz1, -cbx,cby1,cbz1, -cbx,pb,cbz1, 0.08f+ambR*0.3f,0.08f+ambG*0.3f,0.10f+ambB*0.3f)
+        CPANEL_QUAD( cbx,pt,cbz1,  cbx,pb,cbz0,  cbx,pb,cbz1,  cbx,cby1,cbz1, 0.08f+ambR*0.3f,0.08f+ambG*0.3f,0.10f+ambB*0.3f)
+
+        // HUD combiner glass (transparent, tilted)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.12f+dayF2*0.05f, 0.95f, 0.22f, 0.10f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.30f, pt+0.05f, pzt-0.02f);
+          glVertex3f( 0.30f, pt+0.05f, pzt-0.02f);
+          glVertex3f( 0.30f, pt+0.30f, -0.90f);
+          glVertex3f(-0.30f, pt+0.30f, -0.90f);
+        glEnd();
+        // HUD green reticle lines
+        glColor4f(0.0f, 1.0f, 0.1f, 0.55f);
+        glLineWidth(1.2f);
+        glBegin(GL_LINES);
+          // Horizon line
+          glVertex3f(-0.10f, pt+0.18f, -0.91f); glVertex3f( 0.10f, pt+0.18f, -0.91f);
+          // Pitch ladder ticks
+          glVertex3f(-0.04f, pt+0.22f, -0.91f); glVertex3f( 0.04f, pt+0.22f, -0.91f);
+          glVertex3f(-0.04f, pt+0.14f, -0.91f); glVertex3f( 0.04f, pt+0.14f, -0.91f);
+          // Velocity vector circle (small)
+          float vvx = player.roll*0.04f, vvy = player.pitch*0.04f;
+          for(int k=0;k<8;k++){
+              float a0=k*6.28318f/8, a1=(k+1)*6.28318f/8;
+              glVertex3f(vvx+cosf(a0)*0.018f, pt+0.18f+vvy+sinf(a0)*0.018f, -0.91f);
+              glVertex3f(vvx+cosf(a1)*0.018f, pt+0.18f+vvy+sinf(a1)*0.018f, -0.91f);
+          }
+        glEnd();
+        glLineWidth(1.0f);
+        glDisable(GL_BLEND);
+
+        // Throttle quadrant (left console)
+        float tqx = -pw+0.06f, tqw = 0.10f;
+        float tqz = pz+0.10f, tqBot = pb, tqTop = pb+0.28f;
+        CPANEL_QUAD(tqx,tqBot,tqz, tqx+tqw,tqBot,tqz, tqx+tqw,tqTop,tqz, tqx,tqTop,tqz, 0.18f,0.18f,0.20f)
+        // Throttle lever
+        float tlevel = pb + 0.05f + player.throttle*0.20f;
+        CPANEL_QUAD(tqx+0.01f,tlevel,tqz-0.005f, tqx+tqw-0.01f,tlevel,tqz-0.005f,
+                    tqx+tqw-0.01f,tlevel+0.04f,tqz-0.010f, tqx+0.01f,tlevel+0.04f,tqz-0.010f, 0.30f,0.30f,0.35f)
+
+        // Stick
+        float sx = player.roll*0.06f, sy = -player.pitch*0.06f;
+        float sbase = -0.65f, stop = pz+0.12f;
+        glColor3f(0.20f,0.20f,0.22f);
+        glBegin(GL_QUADS);
+          glVertex3f(    -0.025f,      sbase, -0.55f);
+          glVertex3f(     0.025f,      sbase, -0.55f);
+          glVertex3f(sx + 0.025f, stop+sy,   pz+0.02f);
+          glVertex3f(sx - 0.025f, stop+sy,   pz+0.02f);
+        glEnd();
+        // Stick top grip
+        glColor3f(0.25f,0.25f,0.28f);
+        glBegin(GL_QUADS);
+          glVertex3f(sx-0.030f, stop+sy,        pz+0.005f);
+          glVertex3f(sx+0.030f, stop+sy,        pz+0.005f);
+          glVertex3f(sx+0.030f, stop+sy+0.055f, pz+0.005f);
+          glVertex3f(sx-0.030f, stop+sy+0.055f, pz+0.005f);
+        glEnd();
+
+    } else if(player.type == PLANE_PROP){
+        // ---- Cessna 172 cockpit ----
+        float pz  = -1.35f;
+        float pzt = -1.10f;
+        float pt  = -0.36f;
+        float pb  = -0.82f;
+        float pw  =  0.72f;
+        // Main panel (warm beige/grey)
+        CPANEL_QUAD(-pw,pb,pz, pw,pb,pz, pw,pt,pzt, -pw,pt,pzt, 0.28f,0.25f,0.20f)
+
+        // Glare shield (dark foam)
+        CPANEL_QUAD(-pw,pt,pzt, pw,pt,pzt, pw,pt+0.05f,-1.08f, -pw,pt+0.05f,-1.08f, 0.08f,0.07f,0.06f)
+
+        // Window pillars (A-pillar each side)
+        float apz0 = -0.55f, apz1 = -2.2f;
+        float apy0 = -0.12f, apy1 =  0.50f;
+        float apx  =  0.72f, apt  =  0.055f;
+        CPANEL_QUAD(-apx,apy0,apz0, -apx+apt,apy0,apz0, -apx+apt,apy1,apz1, -apx,apy1,apz1, 0.55f,0.52f,0.46f)
+        CPANEL_QUAD( apx-apt,apy0,apz0,  apx,apy0,apz0,  apx,apy1,apz1,  apx-apt,apy1,apz1, 0.55f,0.52f,0.46f)
+
+        // Side walls
+        CPANEL_QUAD(-apx,pb,apz0, -apx,pt,apz1, -apx,apy1,apz1, -apx,pb,apz1, 0.22f+ambR*0.4f,0.20f+ambG*0.4f,0.17f+ambB*0.4f)
+        CPANEL_QUAD( apx,pt,apz1,  apx,pb,apz0,  apx,pb,apz1,  apx,apy1,apz1, 0.22f+ambR*0.4f,0.20f+ambG*0.4f,0.17f+ambB*0.4f)
+
+        // Instrument sub-panel (darker centre section)
+        CPANEL_QUAD(-0.38f,pb+0.06f,pz+0.002f, 0.38f,pb+0.06f,pz+0.002f,
+                     0.38f,pt-0.02f,pzt+0.002f, -0.38f,pt-0.02f,pzt+0.002f, 0.14f,0.13f,0.12f)
+
+        // Yoke column (centre, coming up from below screen)
+        float ycol = player.roll*0.05f, ypush = -player.pitch*0.05f;
+        glColor3f(0.18f,0.18f,0.20f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.028f, -0.80f, -0.70f);
+          glVertex3f( 0.028f, -0.80f, -0.70f);
+          glVertex3f(ycol+0.028f, pt+0.02f+ypush, pzt+0.04f);
+          glVertex3f(ycol-0.028f, pt+0.02f+ypush, pzt+0.04f);
+        glEnd();
+        // Yoke U-bar
+        float yuy = pt+0.04f+ypush, yuz = pzt+0.035f;
+        glBegin(GL_QUADS);
+          glVertex3f(ycol-0.22f, yuy-0.018f, yuz);
+          glVertex3f(ycol+0.22f, yuy-0.018f, yuz);
+          glVertex3f(ycol+0.22f, yuy+0.018f, yuz);
+          glVertex3f(ycol-0.22f, yuy+0.018f, yuz);
+        glEnd();
+        // Yoke left grip
+        glBegin(GL_QUADS);
+          glVertex3f(ycol-0.22f, yuy-0.018f, yuz);
+          glVertex3f(ycol-0.22f+0.025f, yuy-0.018f, yuz);
+          glVertex3f(ycol-0.22f+0.025f, yuy-0.075f, yuz);
+          glVertex3f(ycol-0.22f, yuy-0.075f, yuz);
+        glEnd();
+        // Yoke right grip
+        glBegin(GL_QUADS);
+          glVertex3f(ycol+0.22f-0.025f, yuy-0.018f, yuz);
+          glVertex3f(ycol+0.22f,        yuy-0.018f, yuz);
+          glVertex3f(ycol+0.22f,        yuy-0.075f, yuz);
+          glVertex3f(ycol+0.22f-0.025f, yuy-0.075f, yuz);
+        glEnd();
+
+        // Cowling edge visible over nose
+        glColor3f(0.50f+ambR*0.3f, 0.48f+ambG*0.3f, 0.42f+ambB*0.3f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.40f, pt+0.06f, -1.05f);
+          glVertex3f( 0.40f, pt+0.06f, -1.05f);
+          glVertex3f( 0.40f, pt+0.13f, -1.80f);
+          glVertex3f(-0.40f, pt+0.13f, -1.80f);
+        glEnd();
+
+    } else {
+        // ---- Boeing 737 cockpit ----
+        float pz  = -1.45f;
+        float pzt = -1.18f;
+        float pt  = -0.34f;
+        float pb  = -0.80f;
+        float pw  =  0.88f;
+        // Main panel
+        CPANEL_QUAD(-pw,pb,pz, pw,pb,pz, pw,pt,pzt, -pw,pt,pzt, 0.10f,0.10f,0.11f)
+
+        // Glareshield
+        CPANEL_QUAD(-pw,pt,pzt, pw,pt,pzt, pw,pt+0.06f,-1.10f, -pw,pt+0.06f,-1.10f, 0.06f,0.06f,0.07f)
+
+        // A-pillars
+        float apz0=-0.55f, apz1=-2.2f, apy0=-0.10f, apy1=0.48f, apx=0.88f, apt2=0.06f;
+        CPANEL_QUAD(-apx,apy0,apz0, -apx+apt2,apy0,apz0, -apx+apt2,apy1,apz1, -apx,apy1,apz1, 0.12f,0.12f,0.13f)
+        CPANEL_QUAD( apx-apt2,apy0,apz0,  apx,apy0,apz0,  apx,apy1,apz1,  apx-apt2,apy1,apz1, 0.12f,0.12f,0.13f)
+
+        // Side consoles
+        CPANEL_QUAD(-apx,pb,apz0, -apx,pt,apz1, -apx,apy1,apz1, -apx,pb,apz1, 0.09f+ambR*0.3f,0.09f+ambG*0.3f,0.10f+ambB*0.3f)
+        CPANEL_QUAD( apx,pt,apz1,  apx,pb,apz0,  apx,pb,apz1,  apx,apy1,apz1, 0.09f+ambR*0.3f,0.09f+ambG*0.3f,0.10f+ambB*0.3f)
+
+        // Left EFIS/MFD (blue navigation display)
+        float mfdzF = pzt+0.003f;
+        glColor3f(0.04f,0.18f,0.28f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.70f,pb+0.08f,pz+0.003f); glVertex3f(-0.25f,pb+0.08f,pz+0.003f);
+          glVertex3f(-0.25f,pt-0.03f,mfdzF);      glVertex3f(-0.70f,pt-0.03f,mfdzF);
+        glEnd();
+        // Left EFIS content — magenta heading arc
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.9f,0.2f,0.9f,0.8f);
+        float mfcx=-0.475f, mfcy=pb+0.14f, mfcz=pz+0.005f;
+        glBegin(GL_LINE_STRIP);
+        for(int k=-6;k<=6;k++){ float a=k*0.18f; glVertex3f(mfcx+sinf(a)*0.12f, mfcy+cosf(a)*0.12f, mfcz); }
+        glEnd();
+        glDisable(GL_BLEND);
+
+        // Right EFIS (terrain/weather green)
+        glColor3f(0.04f,0.22f,0.10f);
+        glBegin(GL_QUADS);
+          glVertex3f( 0.25f,pb+0.08f,pz+0.003f); glVertex3f( 0.70f,pb+0.08f,pz+0.003f);
+          glVertex3f( 0.70f,pt-0.03f,mfdzF);      glVertex3f( 0.25f,pt-0.03f,mfdzF);
+        glEnd();
+
+        // Centre ECAM (amber/white)
+        glColor3f(0.10f,0.08f,0.03f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.18f,pb+0.08f,pz+0.003f); glVertex3f( 0.18f,pb+0.08f,pz+0.003f);
+          glVertex3f( 0.18f,pt-0.06f,mfdzF);      glVertex3f(-0.18f,pt-0.06f,mfdzF);
+        glEnd();
+
+        // Dual yokes
+        float ycol=player.roll*0.06f, ypush=-player.pitch*0.05f;
+        float yuy=pt+0.03f+ypush, yuz=pzt+0.04f;
+        // Left yoke stem
+        glColor3f(0.16f,0.16f,0.18f);
+        glBegin(GL_QUADS);
+          glVertex3f(-0.50f-0.02f,-0.78f,-0.80f); glVertex3f(-0.50f+0.02f,-0.78f,-0.80f);
+          glVertex3f(ycol-0.50f+0.02f,yuy,yuz);    glVertex3f(ycol-0.50f-0.02f,yuy,yuz);
+        glEnd();
+        // Left yoke bar
+        glBegin(GL_QUADS);
+          glVertex3f(ycol-0.72f,yuy-0.015f,yuz); glVertex3f(ycol-0.30f,yuy-0.015f,yuz);
+          glVertex3f(ycol-0.30f,yuy+0.015f,yuz); glVertex3f(ycol-0.72f,yuy+0.015f,yuz);
+        glEnd();
+        // Right yoke stem
+        glBegin(GL_QUADS);
+          glVertex3f( 0.50f-0.02f,-0.78f,-0.80f); glVertex3f( 0.50f+0.02f,-0.78f,-0.80f);
+          glVertex3f(ycol+0.50f+0.02f,yuy,yuz);    glVertex3f(ycol+0.50f-0.02f,yuy,yuz);
+        glEnd();
+        // Right yoke bar
+        glBegin(GL_QUADS);
+          glVertex3f(ycol+0.30f,yuy-0.015f,yuz); glVertex3f(ycol+0.72f,yuy-0.015f,yuz);
+          glVertex3f(ycol+0.72f,yuy+0.015f,yuz); glVertex3f(ycol+0.30f,yuy+0.015f,yuz);
+        glEnd();
+    }
+#undef CPANEL_QUAD
+
+    // ---- Instrument gauges (all plane types) ----
+    // 6 gauges in a row on the instrument sub-panel
+    // Positions in eye space
+    float gRowZ;  // Z of gauge face
+    float gRowY;  // Y centre of gauge row
+    float gPW;    // panel half-width for gauge positioning
+    if(player.type==PLANE_FIGHTER){ gRowZ=-1.38f; gRowY=-0.58f; gPW=0.50f; }
+    else if(player.type==PLANE_PROP){ gRowZ=-1.33f; gRowY=-0.60f; gPW=0.34f; }
+    else { gRowZ=-1.43f; gRowY=-0.58f; gPW=0.60f; }
+
+    struct { float val; float needleScale; float r,g,b; } gauges[6] = {
+        { player.y,                          0.008f, 0.80f,0.80f,0.95f }, // ALT
+        { airspeed*6.28318f,                 1.000f, 0.95f,0.85f,0.65f }, // SPD (raw radians → sweep)
+        { player.pitch*(180.0f/(float)M_PI), 0.035f, 0.30f,1.00f,0.35f }, // ATT (artificial horizon proxy)
+        { player.vy*2.5f,                    0.300f, 0.65f,0.95f,0.75f }, // VSI
+        { player.yaw,                        1.000f, 0.95f,0.95f,0.45f }, // HDG (raw radians)
+        { player.roll*(180.0f/(float)M_PI),  0.035f, 0.95f,0.65f,0.65f }, // BANK
+    };
+    int numG=6;
+    float gSpacing = (2.0f*gPW) / (numG-1);
+    float gr=0.060f; // gauge radius
+
+    for(int gi=0;gi<numG;gi++){
+        float cx = -gPW + gi*gSpacing;
+        float cy = gRowY;
+        float cz = gRowZ;
+        // Bezel ring
+        glColor3f(0.30f,0.30f,0.33f);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex3f(cx,cy,cz);
+        for(int k=0;k<=18;k++){
+            float a=k*2.0f*(float)M_PI/18;
+            glVertex3f(cx+cosf(a)*gr, cy+sinf(a)*gr, cz);
+        }
+        glEnd();
+        // Face
+        glColor3f(0.04f,0.04f,0.07f);
+        float fr=gr*0.87f;
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex3f(cx,cy,cz-0.0015f);
+        for(int k=0;k<=18;k++){
+            float a=k*2.0f*(float)M_PI/18;
+            glVertex3f(cx+cosf(a)*fr, cy+sinf(a)*fr, cz-0.0015f);
+        }
+        glEnd();
+        // Tick marks (12)
+        glColor3f(0.55f,0.55f,0.60f);
+        glBegin(GL_LINES);
+        for(int k=0;k<12;k++){
+            float a=k*2.0f*(float)M_PI/12;
+            float ir = fr*(k%3==0?0.65f:0.75f);
+            glVertex3f(cx+cosf(a)*ir,    cy+sinf(a)*ir,    cz-0.002f);
+            glVertex3f(cx+cosf(a)*fr*0.95f, cy+sinf(a)*fr*0.95f, cz-0.002f);
+        }
+        glEnd();
+        // Needle
+        float needleAng = gauges[gi].val * gauges[gi].needleScale;
+        glColor3f(gauges[gi].r, gauges[gi].g, gauges[gi].b);
+        glLineWidth(1.5f);
+        glBegin(GL_LINES);
+        glVertex3f(cx, cy, cz-0.003f);
+        glVertex3f(cx+sinf(needleAng)*fr*0.80f, cy+cosf(needleAng)*fr*0.80f, cz-0.003f);
+        glEnd();
+        glLineWidth(1.0f);
+        // Centre dot
+        glColor3f(0.80f,0.80f,0.85f);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex3f(cx,cy,cz-0.004f);
+        for(int k=0;k<=8;k++){
+            float a=k*2.0f*(float)M_PI/8;
+            glVertex3f(cx+cosf(a)*fr*0.08f, cy+sinf(a)*fr*0.08f, cz-0.004f);
+        }
+        glEnd();
+    }
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+    glEnable(GL_FOG);
+    glEnable(GL_TEXTURE_2D);
+    glPopMatrix();
+}
 
 // -------- Render Scene --------
 void renderScene(){
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glLoadIdentity();
 
+    // Update sun / time-of-day
+    updateSunLight();
+
     // Camera
     float camX, camY, camZ, lookX, lookY, lookZ;
+    float upX=0, upY=1, upZ=0;
     if(!inPlane){
-        // First-person: eye at head height, look forward along walkerYaw
+        cockpitView = false;
+        float sw = sinf(walkerYaw), cw = cosf(walkerYaw);
         camX = walkerX; camY = walkerY + WALKER_EYE_H; camZ = walkerZ;
-        lookX = walkerX + sinf(walkerYaw);
-        lookY = walkerY + WALKER_EYE_H;
-        lookZ = walkerZ + cosf(walkerYaw);
+        lookX = walkerX + sw; lookY = walkerY + WALKER_EYE_H; lookZ = walkerZ + cw;
     } else if(isPassenger){
-        // Side window view: eye offset to the right of the plane
-        float rightX = cosf(player.yaw);
-        float rightZ = -sinf(player.yaw);
+        cockpitView = false;
+        float sYaw = sinf(player.yaw), cYaw = cosf(player.yaw);
         float sc2 = PLANE_DEFS[player.type].scale;
-        camX = player.x + rightX*sc2*0.5f;
+        camX = player.x + cYaw*sc2*0.5f;
         camY = player.y + sc2*0.2f;
-        camZ = player.z + rightZ*sc2*0.5f;
-        lookX = camX + sinf(player.yaw)*20.0f;
-        lookY = camY;
-        lookZ = camZ + cosf(player.yaw)*20.0f;
+        camZ = player.z + (-sYaw)*sc2*0.5f;
+        lookX = camX + sYaw*20.0f; lookY = camY; lookZ = camZ + cYaw*20.0f;
+    } else if(cockpitView && inPlane){
+        // First-person cockpit: camera at pilot's eye, looking out nose
+        float sYaw   = sinf(player.yaw),   cYaw   = cosf(player.yaw);
+        float sPitch = sinf(player.pitch),  cPitch = cosf(player.pitch);
+        float sRoll  = sinf(player.roll),   cRoll  = cosf(player.roll);
+        camX = player.x + sYaw*0.5f; camY = player.y + 1.2f; camZ = player.z + cYaw*0.5f;
+        // Forward vector along plane heading + pitch
+        float fwdX = sYaw*cPitch, fwdY = sPitch, fwdZ = cYaw*cPitch;
+        lookX = camX + fwdX*10; lookY = camY + fwdY*10; lookZ = camZ + fwdZ*10;
+        // Up vector rolled with plane
+        upX = -sYaw*sPitch*cRoll + cYaw*sRoll;
+        upY =  cPitch*cRoll;
+        upZ = -cYaw*sPitch*cRoll - sYaw*sRoll;
     } else {
-        camX = player.x - sinf(player.yaw)*10;
-        camY = player.y + 3; if(camY<1.5f) camY=1.5f;
-        camZ = player.z - cosf(player.yaw)*10;
-        lookX = player.x + sinf(player.yaw)*30;
-        lookY = player.y;
-        lookZ = player.z + cosf(player.yaw)*30;
+        float sYaw = sinf(player.yaw), cYaw = cosf(player.yaw);
+        camX = player.x - sYaw*10; camY = player.y + 3; if(camY<1.5f) camY=1.5f;
+        camZ = player.z - cYaw*10;
+        lookX = player.x + sYaw*30; lookY = player.y; lookZ = player.z + cYaw*30;
     }
-    gluLookAt(camX,camY,camZ, lookX,lookY,lookZ, 0,1,0);
+    gluLookAt(camX,camY,camZ, lookX,lookY,lookZ, upX,upY,upZ);
+
+    // Sky dome (drawn first, behind everything)
+    renderSkyDome(camX, camY, camZ);
 
     pthread_mutex_lock(&terrainMutex);
     renderTerrain();
@@ -2664,16 +4762,22 @@ void renderScene(){
     pthread_mutex_unlock(&terrainMutex);
     renderAllTornados();
 
-    // Parked planes at gates
-    for(int i=0;i<numParked;i++)
-        if(parkedPlanes[i].active)
-            drawPlaneModel(parkedPlanes[i].wx, parkedPlanes[i].wy, parkedPlanes[i].wz,
-                           0, parkedPlanes[i].heading, 0, 1.0f, parkedPlanes[i].type);
+    // Parked planes at gates — cull beyond 400 units
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+    for(int i=0;i<numParked;i++){
+        if(!parkedPlanes[i].active) continue;
+        float ddx=parkedPlanes[i].wx-eyeX, ddz=parkedPlanes[i].wz-eyeZ;
+        if(ddx*ddx+ddz*ddz > 800.0f*800.0f) continue;
+        drawPlaneModel(parkedPlanes[i].wx, parkedPlanes[i].wy, parkedPlanes[i].wz,
+                       0, parkedPlanes[i].heading, 0, 1.0f, parkedPlanes[i].type);
+    }
 
-    renderDiveBombers();
+    renderNpcs();
+    renderMissiles();
 
-    // Player plane (always drawn — parked while on foot)
-    if(!isPassenger)
+    // Player plane — skip in cockpit view (you're inside it)
+    if(!isPassenger && !cockpitView)
         drawPlaneModel(player.x,player.y,player.z,player.pitch,player.yaw,player.roll,gearExtension,player.type);
 
     // Remote players: plane or walker depending on their state
@@ -2690,7 +4794,13 @@ void renderScene(){
     }
     pthread_mutex_unlock(&remoteMutex);
 
+    renderTrees();
     renderExplosions();
+    renderClouds();
+
+    // Cockpit overlay (drawn after world, before HUD)
+    if(cockpitView && inPlane && !isPassenger)
+        renderCockpit();
 
     // HUD overlay
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0,resWidth,0,resHeight);
@@ -2934,109 +5044,464 @@ void renderScene(){
 
     renderRain();
     renderFPS();
+
+    // ---- Chat overlay ----
+    // Decay timers
+    for(int i=0;i<chatCount;){
+        chatLog[i].timer -= DT;
+        if(chatLog[i].timer <= 0.0f && !chatOpen){
+            memmove(&chatLog[i], &chatLog[i+1], sizeof(ChatMsg)*(chatCount-i-1));
+            chatCount--;
+        } else i++;
+    }
+    // Draw up to 6 recent messages bottom-left
+    {
+        float cx = 12.0f, cy = 90.0f;
+        int show = chatCount > 6 ? 6 : chatCount;
+        for(int i = 0; i < show; i++){
+            ChatMsg *m = &chatLog[chatCount - show + i];
+            float alpha = chatOpen ? 0.85f : fminf(m->timer, 1.5f) / 1.5f * 0.85f;
+            glColor4f(0.9f, 0.95f, 1.0f, alpha);
+            glRasterPos2f(cx, cy + i * 16.0f);
+            for(const char *c = m->text; *c; c++)
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
+        }
+        // Input box when open
+        if(chatOpen){
+            menuRect(cx - 2, 60, 320, 20, 0.05f, 0.08f, 0.15f, 0.85f);
+            menuRectOutline(cx - 2, 60, 320, 20, 0.3f, 0.6f, 1.0f);
+            glColor4f(1,1,1,1);
+            glRasterPos2f(cx + 2, 73);
+            char inputDisplay[CHAT_MSG_LEN+4];
+            snprintf(inputDisplay, sizeof(inputDisplay), "> %s_", chatInput);
+            for(const char *c = inputDisplay; *c; c++)
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
+        }
+    }
     // Swap is handled by the caller so menus can overlay before presenting
 }
 
-// -------- Divebombers --------
-static void updateDiveBombers(float dt){
-    for(int i=0;i<MAX_ENEMIES;i++){
-        if(!enemies[i].alive) continue;
-        DiveBomber *db = &enemies[i];
+// -------- Missiles --------
+static void updateMissiles(float dt){
+    if(missileCooldown > 0.0f) missileCooldown -= dt;
 
-        float dx = player.x - db->x;
-        float dy = player.y - db->y;
-        float dz = player.z - db->z;
-        float hdist = sqrtf(dx*dx + dz*dz);
+    for(int i=0;i<MAX_MISSILES;i++){
+        Missile *m = &missiles[i];
+        if(!m->active) continue;
 
-        switch(db->state){
+        float step = MISSILE_SPEED * dt;
+        m->x += m->vx * dt;
+        m->y += m->vy * dt;
+        m->z += m->vz * dt;
+        m->dist += step;
 
-            case DB_CIRCLE: {
-                // Orbit player at ~120 units radius, ~65 units altitude
-                float targetY = terrainHeightAt(db->x, db->z) + 65.0f;
-                db->circleAngle += 0.35f * dt;
-                float tx = player.x + cosf(db->circleAngle) * 120.0f;
-                float tz = player.z + sinf(db->circleAngle) * 120.0f;
-                // Fly toward orbit point
-                float ox = tx - db->x, oz = tz - db->z;
-                float om = sqrtf(ox*ox + oz*oz);
-                db->yaw = atan2f(ox, oz);
-                if(om > 0.1f){ db->x += (ox/om)*db->speed*dt; db->z += (oz/om)*db->speed*dt; }
-                db->y += (targetY - db->y) * 2.0f * dt;
-                db->pitch = 0.0f;
-                db->roll  = 0.25f;
-
-                db->stateTimer -= dt;
-                if(db->stateTimer <= 0.0f && hdist < 200.0f){
-                    db->state = DB_DIVE;
-                    db->stateTimer = 0.0f;
-                    db->speed = 20.0f;
-                }
-                break;
-            }
-
-            case DB_DIVE: {
-                // Nose toward player position on ground
-                float tx = player.x, ty = terrainHeightAt(player.x,player.z)+2.0f, tz = player.z;
-                float ddx = tx-db->x, ddy = ty-db->y, ddz = tz-db->z;
-                float ddm = sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
-                if(ddm > 0.1f){
-                    db->yaw   = atan2f(ddx, ddz);
-                    db->pitch = -asinf(clampf(ddy/ddm, -1.0f, 1.0f)) * 0.6f; // nose-down
-                    db->x += (ddx/ddm)*db->speed*dt;
-                    db->y += (ddy/ddm)*db->speed*dt;
-                    db->z += (ddz/ddm)*db->speed*dt;
-                }
-                db->roll = sinf(db->stateTimer*3.0f)*0.3f; // slight banking wobble
-                db->speed = clampf(db->speed + 8.0f*dt, 0.0f, 28.0f); // accelerate in dive
-                db->stateTimer += dt;
-
-                float groundY = terrainHeightAt(db->x, db->z);
-                // Drop bomb when low and close
-                if(db->y < groundY + 18.0f || db->stateTimer > 6.0f){
-                    // Bomb explodes at player position (area bomb)
-                    triggerExplosionEx(player.x, terrainHeightAt(player.x,player.z)+1.0f, player.z, 2.5f);
-                    triggerExplosionEx(player.x+3.0f, terrainHeightAt(player.x,player.z)+0.5f, player.z-2.0f, 1.8f);
-                    db->state = DB_PULLUP;
-                    db->stateTimer = 0.0f;
-                    db->speed = 18.0f;
-                }
-                break;
-            }
-
-            case DB_PULLUP: {
-                // Hard climb away
-                float targetY = terrainHeightAt(db->x,db->z) + 70.0f;
-                db->pitch = clampf(db->pitch + 1.8f*dt, -1.2f, 0.5f);
-                db->x += sinf(db->yaw)*cosf(db->pitch)*db->speed*dt;
-                db->y += sinf(db->pitch)*db->speed*dt + 10.0f*dt;
-                db->z += cosf(db->yaw)*cosf(db->pitch)*db->speed*dt;
-                db->roll *= 0.9f;
-                db->stateTimer += dt;
-                // Once high enough, go back to circling
-                if(db->y >= targetY - 5.0f || db->stateTimer > 5.0f){
-                    db->state = DB_CIRCLE;
-                    db->stateTimer = 3.0f + ((float)rand()/RAND_MAX)*4.0f;
-                    db->pitch = 0.0f;
-                    db->speed = 12.0f;
-                }
-                break;
-            }
-
-            case DB_DEAD:
-            default: break;
+        // Self-destruct if out of range or hit the ground
+        if(m->dist > MISSILE_RANGE || m->y < terrainHeightAt(m->x, m->z)){
+            triggerExplosion(m->x, m->y, m->z);
+            m->active = false;
+            continue;
         }
 
-        // Clamp above terrain
-        float gnd = terrainHeightAt(db->x, db->z);
-        if(db->y < gnd + 1.0f){ db->y = gnd + 1.0f; }
+        // Check NPC planes
+        for(int n=0;n<numNpcs;n++){
+            Npc *np = &npcs[n];
+            if(!np->alive) continue;
+            if(np->state != NPC_FLY && np->state != NPC_APPROACH &&
+               np->state != NPC_TAKEOFF && np->state != NPC_LAND) continue;
+            float dx=m->x-np->px, dy=m->y-np->py, dz=m->z-np->pz;
+            if(dx*dx+dy*dy+dz*dz < MISSILE_HIT_R*MISSILE_HIT_R){
+                triggerExplosionEx(np->px, np->py, np->pz, 2.5f);
+                np->alive = false;
+                m->active = false;
+                break;
+            }
+        }
     }
 }
 
-static void renderDiveBombers(){
-    for(int i=0;i<MAX_ENEMIES;i++){
-        if(!enemies[i].alive) continue;
-        DiveBomber *db = &enemies[i];
-        drawPlaneModel(db->x, db->y, db->z, db->pitch, db->yaw, db->roll, 0.0f, PLANE_FIGHTER);
+static void fireMissile(){
+    if(missileCooldown > 0.0f) return;
+    if(player.type != PLANE_FIGHTER) return;
+    // Find free slot
+    for(int i=0;i<MAX_MISSILES;i++){
+        if(missiles[i].active) continue;
+        Missile *m = &missiles[i];
+        float sp = sinf(player.pitch), cp = cosf(player.pitch);
+        float sy = sinf(player.yaw),   cy = cosf(player.yaw);
+        // Direction: forward along plane heading + pitch
+        m->vx = sy * cp * MISSILE_SPEED;
+        m->vy = sp      * MISSILE_SPEED;
+        m->vz = cy * cp * MISSILE_SPEED;
+        // Spawn slightly ahead of nose
+        m->x = player.x + sy*3.0f;
+        m->y = player.y + sp*3.0f;
+        m->z = player.z + cy*3.0f;
+        m->dist = 0.0f;
+        m->active = true;
+        missileCooldown = MISSILE_COOLDOWN;
+        sndPlay(SND_MISSILE);
+        return;
+    }
+}
+
+static void renderMissiles(){
+    for(int i=0;i<MAX_MISSILES;i++){
+        Missile *m = &missiles[i];
+        if(!m->active) continue;
+
+        glPushMatrix();
+        glTranslatef(m->x, m->y, m->z);
+
+        // Align missile along its velocity direction
+        float len = sqrtf(m->vx*m->vx + m->vy*m->vy + m->vz*m->vz);
+        if(len > 0.001f){
+            float dx=m->vx/len, dy=m->vy/len, dz=m->vz/len;
+            float pitch = asinf(dy);
+            float yaw   = atan2f(dx, dz);
+            glRotatef(yaw   * 180.0f / (float)M_PI, 0,1,0);
+            glRotatef(-pitch * 180.0f / (float)M_PI, 1,0,0);
+        }
+
+        // Body — white/grey cylinder
+        glColor3f(0.85f,0.85f,0.88f);
+        drawOctSegment(0.0f,0.0f, 0.8f, 0.06f,0.06f, 0.6f);
+        drawOctSegment(0.06f,0.06f, 0.6f, 0.06f,0.06f,-0.4f);
+        drawOctSegment(0.06f,0.06f,-0.4f, 0.0f,0.0f,-0.6f);
+        drawOctCap(0.0f,0.0f, 0.8f, 0,0,1);
+        // Nose cone — dark
+        glColor3f(0.20f,0.20f,0.22f);
+        drawOctSegment(0.0f,0.0f, 1.0f, 0.06f,0.06f, 0.8f);
+        drawOctCap(0.0f,0.0f, 1.0f, 0,0,1);
+        // 4 tail fins
+        glColor3f(0.70f,0.70f,0.72f);
+        for(int f=0;f<4;f++){
+            glPushMatrix();
+            glRotatef(f*90.0f, 0,0,1);
+            glBegin(GL_TRIANGLES);
+                glNormal3f(1,0,0);
+                glVertex3f( 0.005f,0.06f,-0.20f);
+                glVertex3f( 0.005f,0.06f,-0.55f);
+                glVertex3f( 0.005f,0.22f,-0.50f);
+                glNormal3f(-1,0,0);
+                glVertex3f(-0.005f,0.06f,-0.20f);
+                glVertex3f(-0.005f,0.22f,-0.50f);
+                glVertex3f(-0.005f,0.06f,-0.55f);
+            glEnd();
+            glPopMatrix();
+        }
+        // Rocket exhaust glow (additive orange)
+        glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE);
+        glDisable(GL_LIGHTING);
+        float flicker = 0.8f + 0.2f*(float)(rand()%100)/100.0f;
+        glColor3f(1.0f*flicker, 0.45f*flicker, 0.0f);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(0.0f, 0.0f, -0.8f);
+            for(int k=0;k<=8;k++){
+                float a=k*6.28318f/8;
+                glVertex3f(cosf(a)*0.05f, sinf(a)*0.05f, -0.6f);
+            }
+        glEnd();
+        glEnable(GL_LIGHTING);
+        glDisable(GL_BLEND);
+
+        glPopMatrix();
+    }
+}
+
+// -------- NPCs --------
+static void updateNpcs(float dt){
+    for(int i=0;i<numNpcs;i++){
+        Npc *n = &npcs[i];
+        if(!n->alive) continue;
+        Airport *ap = &airports[n->airportIdx];
+
+        switch(n->state){
+
+        case NPC_WALK: {
+            // Wander around the apron
+            n->wanderTimer -= dt;
+            if(n->wanderTimer <= 0.0f){
+                n->wanderTimer = 1.5f + ((float)rand()/RAND_MAX)*3.0f;
+                n->wanderYaw   = n->yaw + ((float)rand()/RAND_MAX - 0.5f)*2.5f;
+            }
+            // Steer toward wander heading
+            float dyaw = n->wanderYaw - n->yaw;
+            while(dyaw >  (float)M_PI) dyaw -= 2.0f*(float)M_PI;
+            while(dyaw < -(float)M_PI) dyaw += 2.0f*(float)M_PI;
+            n->yaw += dyaw * 3.0f * dt;
+
+            // Keep on apron — bias back toward home if too far
+            float hx = n->x - n->homeX, hz = n->z - n->homeZ;
+            float hdist = sqrtf(hx*hx+hz*hz);
+            float speed = 2.5f;
+            if(hdist > 18.0f){
+                float toHomeYaw = atan2f(n->homeX-n->x, n->homeZ-n->z);
+                float d2 = toHomeYaw - n->yaw;
+                while(d2 >  (float)M_PI) d2 -= 2.0f*(float)M_PI;
+                while(d2 < -(float)M_PI) d2 += 2.0f*(float)M_PI;
+                n->yaw += d2 * 4.0f * dt;
+                speed = 4.0f;
+            }
+            n->x += sinf(n->yaw)*speed*dt;
+            n->z += cosf(n->yaw)*speed*dt;
+            n->y  = ap->groundY;
+
+            // After walk timer expires, try to find a parked plane to board
+            n->stateTimer -= dt;
+            if(n->stateTimer <= 0.0f){
+                // Find nearest active parked plane at this airport
+                int best = -1;
+                float bestD = 1e9f;
+                for(int p=0;p<numParked;p++){
+                    if(!parkedPlanes[p].active) continue;
+                    float dx=parkedPlanes[p].wx-n->homeX, dz=parkedPlanes[p].wz-n->homeZ;
+                    if(sqrtf(dx*dx+dz*dz)>220.0f) continue; // not our airport
+                    dx=parkedPlanes[p].wx-n->x; dz=parkedPlanes[p].wz-n->z;
+                    float d=sqrtf(dx*dx+dz*dz);
+                    if(d<bestD){ bestD=d; best=p; }
+                }
+                if(best>=0){
+                    n->wpIdx   = best; // reuse wpIdx as target parked plane
+                    n->state   = NPC_BOARD;
+                    n->stateTimer = 15.0f; // timeout
+                } else {
+                    n->stateTimer = 5.0f + ((float)rand()/RAND_MAX)*10.0f;
+                }
+            }
+            break;
+        }
+
+        case NPC_BOARD: {
+            // Walk toward target parked plane
+            int p = n->wpIdx;
+            if(p<0||p>=numParked||!parkedPlanes[p].active){
+                n->state=NPC_WALK; n->stateTimer=5.0f; break;
+            }
+            float tx=parkedPlanes[p].wx, tz=parkedPlanes[p].wz;
+            float dx=tx-n->x, dz=tz-n->z;
+            float d=sqrtf(dx*dx+dz*dz);
+            if(d>0.3f){
+                n->yaw = atan2f(dx,dz);
+                float spd = d>2.0f ? 4.5f : 1.5f;
+                n->x += sinf(n->yaw)*spd*dt;
+                n->z += cosf(n->yaw)*spd*dt;
+                n->y  = ap->groundY;
+            }
+            n->stateTimer -= dt;
+            if(d < 3.0f || n->stateTimer<=0.0f){
+                if(d < 3.0f){
+                    // Board the plane
+                    parkedPlanes[p].active = false;
+                    n->ptype    = parkedPlanes[p].type;
+                    n->px       = parkedPlanes[p].wx;
+                    n->py       = parkedPlanes[p].wy;
+                    n->pz       = parkedPlanes[p].wz;
+                    n->pyaw     = parkedPlanes[p].heading;
+                    n->ppitch   = 0.0f; n->proll = 0.0f;
+                    n->pspeed   = 0.0f;
+                    n->pthrottle= 0.0f;
+                    n->state    = NPC_TAKEOFF;
+                    n->stateTimer = 30.0f;
+                } else {
+                    n->state=NPC_WALK; n->stateTimer=5.0f;
+                }
+            }
+            break;
+        }
+
+        case NPC_TAKEOFF: {
+            float groundY = ap->groundY;
+            float maxSpd  = PLANE_DEFS[n->ptype].maxSpeed;
+            float tkSpd   = PLANE_DEFS[n->ptype].takeoffSpeed;
+            float accel   = PLANE_DEFS[n->ptype].accel;
+            n->pthrottle  = 1.0f;
+            n->pspeed    += accel * dt;
+            if(n->pspeed > maxSpd) n->pspeed = maxSpd;
+            // Roll along heading
+            n->px += sinf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+            n->pz += cosf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+            if(n->pspeed >= tkSpd){
+                n->ppitch += 0.8f*dt;
+                if(n->ppitch > 0.25f) n->ppitch = 0.25f;
+            }
+            n->py += sinf(n->ppitch)*n->pspeed*dt;
+            // Ground floor
+            float tkGnd = terrainHeightAt(n->px, n->pz);
+            if(n->py < tkGnd + 1.0f) n->py = tkGnd + 1.0f;
+            if(n->py > groundY + 60.0f || n->stateTimer<=0.0f){
+                n->ppitch = 0.05f;
+                n->state  = NPC_FLY;
+                n->wpIdx  = 0;
+                n->stateTimer = 60.0f + ((float)rand()/RAND_MAX)*60.0f;
+            }
+            n->stateTimer -= dt;
+            break;
+        }
+
+        case NPC_FLY: {
+            float maxSpd = PLANE_DEFS[n->ptype].maxSpeed;
+            float accel  = PLANE_DEFS[n->ptype].accel;
+            // Circuit of 4 waypoints around the home airport
+            float cx=ap->wx, cz=ap->wz;
+            float alt = ap->groundY + 120.0f;
+            float offsets[4][2] = {{400,400},{-400,400},{-400,-400},{400,-400}};
+            int wi = n->wpIdx % 4;
+            n->wpX = cx + offsets[wi][0];
+            n->wpZ = cz + offsets[wi][1];
+            n->wpAlt = alt;
+            float dx=n->wpX-n->px, dz=n->wpZ-n->pz;
+            float hdist=sqrtf(dx*dx+dz*dz);
+            if(hdist > 5.0f){
+                float tgtYaw = atan2f(dx,dz);
+                float dyaw = tgtYaw - n->pyaw;
+                while(dyaw >  (float)M_PI) dyaw -= 2.0f*(float)M_PI;
+                while(dyaw < -(float)M_PI) dyaw += 2.0f*(float)M_PI;
+                n->pyaw += dyaw * 1.5f * dt;
+                n->proll = clampf(-dyaw*1.2f, -0.5f, 0.5f);
+            } else {
+                n->wpIdx++;
+            }
+            // Altitude hold
+            float dalt = n->wpAlt - n->py;
+            n->ppitch = clampf(dalt * 0.02f, -0.3f, 0.25f);
+            n->pspeed += accel * 0.5f * dt;
+            if(n->pspeed > maxSpd*0.85f) n->pspeed = maxSpd*0.85f;
+            n->px += sinf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+            n->py += sinf(n->ppitch)*n->pspeed*dt;
+            n->pz += cosf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+            // Ground collision
+            { float flyGnd = terrainHeightAt(n->px, n->pz) + 1.5f;
+              if(n->py < flyGnd){ n->py = flyGnd; if(n->ppitch < 0.0f) n->ppitch = 0.1f; } }
+            n->stateTimer -= dt;
+            if(n->stateTimer <= 0.0f){
+                n->state = NPC_APPROACH;
+                n->stateTimer = 30.0f;
+            }
+            break;
+        }
+
+        case NPC_APPROACH: {
+            // Fly toward airport at descending glide
+            float tgtX=ap->wx, tgtZ=ap->wz;
+            float tgtY=ap->groundY + 2.0f;
+            float dx=tgtX-n->px, dy=tgtY-n->py, dz=tgtZ-n->pz;
+            float dist=sqrtf(dx*dx+dy*dy+dz*dz);
+            if(dist>1.0f){
+                float tgtYaw=atan2f(dx,dz);
+                float dyaw=tgtYaw-n->pyaw;
+                while(dyaw >  (float)M_PI) dyaw -= 2.0f*(float)M_PI;
+                while(dyaw < -(float)M_PI) dyaw += 2.0f*(float)M_PI;
+                n->pyaw += dyaw*2.0f*dt;
+                n->proll = clampf(-dyaw*1.5f,-0.5f,0.5f);
+                n->ppitch = clampf(dy/dist*0.6f,-0.3f,0.2f);
+                float maxSpd=PLANE_DEFS[n->ptype].maxSpeed;
+                float tkSpd=PLANE_DEFS[n->ptype].takeoffSpeed;
+                float tgtSpd = tkSpd*1.3f;
+                if(n->pspeed > tgtSpd) n->pspeed -= 3.0f*dt;
+                if(n->pspeed < tgtSpd*0.7f) n->pspeed = tgtSpd*0.7f;
+                n->px += sinf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+                n->py += sinf(n->ppitch)*n->pspeed*dt;
+                n->pz += cosf(n->pyaw)*cosf(n->ppitch)*n->pspeed*dt;
+                float gnd=terrainHeightAt(n->px,n->pz);
+                if(n->py < gnd+1.5f){ n->py=gnd+1.0f; n->state=NPC_LAND; n->stateTimer=8.0f; }
+            } else {
+                n->state=NPC_LAND; n->stateTimer=8.0f;
+            }
+            n->stateTimer-=dt;
+            if(n->stateTimer<=0.0f){ n->state=NPC_WALK; n->stateTimer=5.0f; }
+            break;
+        }
+
+        case NPC_LAND: {
+            // Roll to stop
+            n->pspeed -= PLANE_DEFS[n->ptype].brakeDecel * dt;
+            if(n->pspeed < 0.0f) n->pspeed = 0.0f;
+            float gnd = terrainHeightAt(n->px,n->pz);
+            n->py = gnd + 1.0f;
+            n->ppitch *= 0.9f; n->proll *= 0.9f;
+            n->px += sinf(n->pyaw)*n->pspeed*dt;
+            n->pz += cosf(n->pyaw)*n->pspeed*dt;
+            n->stateTimer -= dt;
+            if(n->pspeed<=0.0f || n->stateTimer<=0.0f){
+                // Repark the plane
+                if(numParked<MAX_PARKED){
+                    ParkedPlane *pp=&parkedPlanes[numParked++];
+                    pp->wx=n->px; pp->wy=n->py; pp->wz=n->pz;
+                    pp->heading=n->pyaw; pp->active=true; pp->type=n->ptype;
+                }
+                // Deplane: walker pops out next to plane
+                n->x = n->px + cosf(n->pyaw)*2.0f;
+                n->z = n->pz - sinf(n->pyaw)*2.0f;
+                n->y = terrainHeightAt(n->x,n->z);
+                n->yaw = n->pyaw;
+                n->state = NPC_DEPLANE;
+                n->stateTimer = 2.0f + ((float)rand()/RAND_MAX)*3.0f;
+            }
+            break;
+        }
+
+        case NPC_DEPLANE: {
+            // Walk away briefly then look for a different plane to swap to
+            n->x += sinf(n->yaw)*2.5f*dt;
+            n->z += cosf(n->yaw)*2.5f*dt;
+            n->y  = terrainHeightAt(n->x,n->z);
+            n->stateTimer -= dt;
+            if(n->stateTimer<=0.0f){
+                // Look for a nearby parked plane of a DIFFERENT type to swap to
+                int swapTarget = -1;
+                float bestSwapDist = 1e9f;
+                for(int p=0;p<numParked;p++){
+                    if(!parkedPlanes[p].active) continue;
+                    if(parkedPlanes[p].type == n->ptype) continue; // skip same type
+                    float pdx=parkedPlanes[p].wx-n->x, pdz=parkedPlanes[p].wz-n->z;
+                    float pd=sqrtf(pdx*pdx+pdz*pdz);
+                    if(pd < 220.0f && pd < bestSwapDist){ bestSwapDist=pd; swapTarget=p; }
+                }
+                if(swapTarget >= 0 && (rand()%3 != 0)){ // 67% chance to swap
+                    n->wpIdx  = swapTarget;
+                    n->state  = NPC_BOARD;
+                    n->stateTimer = 20.0f;
+                } else {
+                    n->homeX = n->x; n->homeZ = n->z;
+                    n->state = NPC_WALK;
+                    n->stateTimer = 10.0f + ((float)rand()/RAND_MAX)*15.0f;
+                    n->wanderTimer = 1.0f;
+                    n->wanderYaw   = n->yaw;
+                }
+            }
+            break;
+        }
+
+        } // switch
+    } // for npcs
+}
+
+static void renderNpcs(){
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+    for(int i=0;i<numNpcs;i++){
+        Npc *n = &npcs[i];
+        if(!n->alive) continue;
+        switch(n->state){
+        case NPC_WALK:
+        case NPC_BOARD:
+        case NPC_DEPLANE: {
+            float dx=n->x-eyeX, dz=n->z-eyeZ;
+            if(dx*dx+dz*dz > 600.0f*600.0f) break;
+            drawWalkerModel(n->x, n->y, n->z, n->yaw);
+            break;
+        }
+        case NPC_TAKEOFF:
+        case NPC_FLY:
+        case NPC_APPROACH:
+        case NPC_LAND: {
+            float dx=n->px-eyeX, dz=n->pz-eyeZ;
+            if(dx*dx+dz*dz > 1200.0f*1200.0f) break;
+            drawPlaneModel(n->px, n->py, n->pz, n->ppitch, n->pyaw, n->proll,
+                           (n->state==NPC_LAND||n->state==NPC_TAKEOFF)?1.0f:0.5f, n->ptype);
+            break;
+        }
+        }
     }
 }
 
@@ -3046,11 +5511,12 @@ void updatePhysics(float dt){
 
     if(!inPlane){
         // ---- On-foot walker ----
-        if(keys[XK_a]) walkerYaw -= 1.5f*dt;
-        if(keys[XK_d]) walkerYaw += 1.5f*dt;
+        if(keys[XK_a]) walkerYaw += 1.5f*dt;
+        if(keys[XK_d]) walkerYaw -= 1.5f*dt;
         float moveX = 0, moveZ = 0;
-        if(keys[XK_w]){ moveX += sinf(walkerYaw)*WALKER_SPEED*dt; moveZ += cosf(walkerYaw)*WALKER_SPEED*dt; }
-        if(keys[XK_s]){ moveX -= sinf(walkerYaw)*WALKER_SPEED*dt; moveZ -= cosf(walkerYaw)*WALKER_SPEED*dt; }
+        float swY = sinf(walkerYaw), cwY = cosf(walkerYaw);
+        if(keys[XK_w]){ moveX += swY*WALKER_SPEED*dt; moveZ += cwY*WALKER_SPEED*dt; }
+        if(keys[XK_s]){ moveX -= swY*WALKER_SPEED*dt; moveZ -= cwY*WALKER_SPEED*dt; }
         walkerX += moveX;
         walkerZ += moveZ;
         walkerY  = terrainHeightAt(walkerX, walkerZ) + 1.0f;
@@ -3144,8 +5610,11 @@ void updatePhysics(float dt){
     player.throttle = clampf(player.throttle, 0.0f, 1.0f);
 
     // G key: toggle gear (debounced, blocked on ground)
-    if(keys[XK_g]){ if(!gearKeyHeld && !onGround){ gearDeployed=!gearDeployed; gearKeyHeld=true; } }
+    if(keys[XK_g]){ if(!gearKeyHeld && !onGround){ gearDeployed=!gearDeployed; gearKeyHeld=true; sndPlay(SND_GEAR); } }
     else gearKeyHeld=false;
+    // C key: toggle cockpit view (only when flying as pilot)
+    if(keys[XK_c]){ if(!cockpitKeyHeld && inPlane && !isPassenger){ cockpitView=!cockpitView; cockpitKeyHeld=true; } }
+    else cockpitKeyHeld=false;
     // Auto-deploy gear on touchdown approach (below 10 units AGL)
     float groundBelow = terrainHeightAt(player.x, player.z);
     float agl = player.y - groundBelow;
@@ -3157,6 +5626,14 @@ void updatePhysics(float dt){
     else if(gearExtension > gearTarget) gearExtension = clampf(gearExtension-gearStep,0.0f,1.0f);
 
     float groundY = groundBelow + 1.0f;  // wheel contact height
+
+    // Space key: fire missile (fighter only, airborne only)
+    if(keys[XK_space]){
+        if(!missileKeyHeld && !onGround && player.type == PLANE_FIGHTER){
+            fireMissile();
+            missileKeyHeld = true;
+        }
+    } else missileKeyHeld = false;
 
     // F key: exit plane when stopped on ground
     if(keys[XK_f]){
@@ -3187,9 +5664,10 @@ void updatePhysics(float dt){
             airspeed -= BRAKE_DECEL * dt;
         airspeed = clampf(airspeed, 0.0f, MAX_SPEED);
 
-        player.vx = sinf(player.yaw) * airspeed;
+        float sy = sinf(player.yaw), cy2 = cosf(player.yaw);
+        player.vx = sy * airspeed;
         player.vy = 0.0f;
-        player.vz = cosf(player.yaw) * airspeed;
+        player.vz = cy2 * airspeed;
 
         player.x += player.vx * dt;
         player.y  = groundY;
@@ -3202,42 +5680,49 @@ void updatePhysics(float dt){
             player.vy    =  airspeed * sinf(player.pitch);
         }
     } else {
-        // ---- In flight ----
-        if(keys[XK_w]) player.pitch += 1.2f*dt;
-        if(keys[XK_s]) player.pitch -= 1.2f*dt;
-        if(keys[XK_a]) player.roll  -= 1.0f*dt;
-        if(keys[XK_d]) player.roll  += 1.0f*dt;
-        player.pitch = clampf(player.pitch, -1.2f, 1.2f);
-        player.roll  = clampf(player.roll,  -1.4f, 1.4f);
+        // ---- In flight — arcade physics ----
+        // Control inputs
+        float pitchRate = 1.0f, rollRate = 0.9f;
+        if(keys[XK_w]) player.pitch += pitchRate*dt;
+        if(keys[XK_s]) player.pitch -= pitchRate*dt;
+        if(keys[XK_a]) player.roll  -= rollRate*dt;
+        if(keys[XK_d]) player.roll  += rollRate*dt;
+        player.pitch = clampf(player.pitch, -1.3f, 1.3f);
+        player.roll  = clampf(player.roll,  -1.5f, 1.5f);
 
-        // Update turbulence intensity: slowly drift toward a random target
+        // Coordinated turn: bank drives yaw
+        player.yaw -= sinf(player.roll) * dt;
+
+        // Turbulence
         turbulenceTimer -= dt;
         if(turbulenceTimer <= 0.0f){
-            turbulenceTarget = ((float)rand()/RAND_MAX) * ((float)rand()/RAND_MAX); // bias toward calm
-            turbulenceTimer  = 4.0f + ((float)rand()/RAND_MAX) * 8.0f; // change every 4–12 s
+            turbulenceTarget = ((float)rand()/RAND_MAX)*((float)rand()/RAND_MAX);
+            turbulenceTimer  = 4.0f + ((float)rand()/RAND_MAX)*8.0f;
         }
-        turbulenceLevel += (turbulenceTarget - turbulenceLevel) * dt * 0.4f;
-
+        turbulenceLevel += (turbulenceTarget - turbulenceLevel)*dt*0.4f;
         float turb = turbulenceLevel * TURBULENCE_MAX;
         player.pitch += ((float)rand()/RAND_MAX-0.5f)*turb;
         player.roll  += ((float)rand()/RAND_MAX-0.5f)*turb;
         player.yaw   += ((float)rand()/RAND_MAX-0.5f)*turb*0.5f;
-        player.yaw   -= sinf(player.roll)*dt;
 
+        // Throttle drives airspeed convergence
         float thrustSpeed = player.throttle * MAX_SPEED;
-        // Converge current airspeed toward throttle target
         float accel = (thrustSpeed > airspeed) ? PLANE_DEFS[player.type].accel : -2.0f;
         airspeed += accel * dt;
-        airspeed  = clampf(airspeed, 0.0f, MAX_SPEED);
+        if(airspeed < 0.0f) airspeed = 0.0f;
+        // No upper clamp — dive speed is unlimited
 
-        // Extra sink below stall speed
+        // Stall sink
         float stallSink = 0.0f;
         if(airspeed < STALL_SPEED)
             stallSink = (STALL_SPEED - airspeed) * 2.0f;
 
-        player.vx =  sinf(player.yaw)*cosf(player.pitch)*airspeed;
-        player.vy =  sinf(player.pitch)*airspeed - GRAVITY*dt - stallSink;
-        player.vz =  cosf(player.yaw)*cosf(player.pitch)*airspeed;
+        float syaw  = sinf(player.yaw),  cyaw  = cosf(player.yaw);
+        float spitch = sinf(player.pitch), cpitch = cosf(player.pitch);
+
+        player.vx = syaw  * cpitch * airspeed;
+        player.vy = spitch * airspeed - GRAVITY*dt - stallSink;
+        player.vz = cyaw  * cpitch * airspeed;
 
         player.x += (player.vx + weather.windX)*dt;
         player.y +=  player.vy*dt;
@@ -3263,12 +5748,14 @@ void updatePhysics(float dt){
                 gearDeployed = true;
                 player.pitch = 0.0f;
                 player.roll  = 0.0f;
+                menuState = MENU_DEAD;
             } else if(gearExtension > 0.9f){
                 // Normal landing
                 onGround  = true;
                 airspeed  = sqrtf(player.vx*player.vx + player.vz*player.vz);
                 player.pitch = 0.0f;
                 player.roll  = 0.0f;
+                sndPlay(SND_LAND);
             } else {
                 // Gear-up, slow speed (e.g. stall onto runway) — no explosion, just stop
                 airspeed  = 0.0f;
@@ -3481,7 +5968,7 @@ void renderMenu(){
         menuButton(BTN_X, row - 14, "Back", mx,my);
 
     } else if(menuState==MENU_JOIN){
-        float cy = resHeight/2.0f + 60;
+        float cy = resHeight/2.0f + 80;
 
         glColor3f(0.6f,0.85f,1.0f);
         int htw=0; const char *ht="Join Server";
@@ -3489,7 +5976,7 @@ void renderMenu(){
         menuText((resWidth-htw)/2.0f, cy+80, ht, GLUT_BITMAP_TIMES_ROMAN_24);
         menuDivider(cy+66);
 
-        // IP label + input box on same row
+        // IP label + input box
         glColor3f(0.85f,0.85f,0.85f);
         menuText(LBL_X, cy+26, "Server IP:", GLUT_BITMAP_HELVETICA_18);
 
@@ -3501,7 +5988,6 @@ void renderMenu(){
             joinIPFocus?0.5f:0.32f, joinIPFocus?0.78f:0.55f, joinIPFocus?1.0f:0.75f);
         glColor3f(1,1,1);
         menuText(ibx+6, iby+7, joinIP, GLUT_BITMAP_HELVETICA_18);
-        // cursor blink
         if(joinIPFocus){
             int cw=0; for(const char *c=joinIP;*c;c++) cw+=glutBitmapWidth(GLUT_BITMAP_HELVETICA_18,*c);
             glColor3f(0.7f,0.9f,1.0f);
@@ -3510,16 +5996,51 @@ void renderMenu(){
             glEnd();
         }
 
+        // ── LAN Servers list ──────────────────────────────
+        float listY = cy - 10;
+        glColor3f(0.55f,0.78f,1.0f);
+        menuText(LBL_X, listY, "LAN Servers:", GLUT_BITMAP_HELVETICA_12);
+        listY -= 4;
+
+        pthread_mutex_lock(&lanMutex);
+        if(numLanServers == 0){
+            glColor3f(0.45f,0.45f,0.48f);
+            menuText(CTL_X, listY - 16, "Scanning...", GLUT_BITMAP_HELVETICA_12);
+        }
+        for(int li = 0; li < numLanServers; li++){
+            float rowY = listY - 20 - li*26;
+            bool sel = (li == selectedServer);
+            menuRect(CTL_X-2, rowY-2, 180, 22,
+                sel ? 0.15f:0.08f, sel ? 0.30f:0.12f, sel ? 0.55f:0.18f, 0.90f);
+            if(sel) menuRectOutline(CTL_X-2, rowY-2, 180, 22, 0.4f,0.7f,1.0f);
+            glColor3f(sel?1.0f:0.85f, sel?1.0f:0.85f, sel?1.0f:0.85f);
+            menuText(CTL_X+4, rowY+4, lanServers[li].ip, GLUT_BITMAP_HELVETICA_12);
+        }
+        pthread_mutex_unlock(&lanMutex);
+
         // Error message
         if(joinFailed){
             const char *err = "No server found. Check IP and try again.";
-            int ew=0; for(const char *c=err;*c;c++) ew+=glutBitmapWidth(GLUT_BITMAP_HELVETICA_18,*c);
+            int ew=0; for(const char *c=err;*c;c++) ew+=glutBitmapWidth(GLUT_BITMAP_HELVETICA_12,*c);
             glColor3f(1.0f,0.25f,0.25f);
-            menuText((resWidth-ew)/2.0f, cy-18, err, GLUT_BITMAP_HELVETICA_18);
+            menuText((resWidth-ew)/2.0f, cy - 10 - (numLanServers?numLanServers*26+4:24) - 16,
+                     err, GLUT_BITMAP_HELVETICA_12);
         }
 
-        menuButton(BTN_X, cy-66,  "Connect", mx,my);
-        menuButton(BTN_X, cy-116, "Back",    mx,my);
+        menuButton(BTN_X, cy-130, "Connect", mx,my);
+        menuButton(BTN_X, cy-180, "Back",    mx,my);
+
+    } else if(menuState==MENU_DEAD){
+        // Semi-transparent dark red overlay
+        menuRect(0,0,(float)resWidth,(float)resHeight, 0.18f,0.02f,0.02f,0.72f);
+
+        // "YOU CRASHED" in big red text
+        const char *msg = "YOU CRASHED";
+        int mw=0; for(const char *c=msg;*c;c++) mw+=glutBitmapWidth(GLUT_BITMAP_TIMES_ROMAN_24,*c);
+        glColor3f(1.0f,0.15f,0.10f);
+        menuText((resWidth-mw)/2.0f, resHeight/2.0f+40, msg, GLUT_BITMAP_TIMES_ROMAN_24);
+
+        menuButton(BTN_X, resHeight/2.0f-20, "Return to Menu", mx,my);
     }
 
     end2D();
@@ -3591,15 +6112,35 @@ void handleMenuClick(int mx, int my_x11){
         if(inRect(mx,my, BTN_X, row-14, BTN_W,BTN_H)) menuState=MENU_MAIN;
 
     } else if(menuState==MENU_JOIN){
-        float cy  = resHeight/2.0f + 60;
+        float cy  = resHeight/2.0f + 80;
         float ibx = CTL_X, iby = cy+12;
         joinIPFocus = inRect(mx,my, ibx,iby, 160,28);
-        if(inRect(mx,my, BTN_X,cy-66,  BTN_W,BTN_H)){
-            // Attempt to connect
+
+        // Click on a LAN server row — fill IP box and select
+        float listY = cy - 10;
+        pthread_mutex_lock(&lanMutex);
+        for(int li = 0; li < numLanServers; li++){
+            float rowY = listY - 20 - li*26;
+            if(inRect(mx,my, (int)(CTL_X-2),(int)(rowY-2), 180,22)){
+                selectedServer = li;
+                strncpy(joinIP, lanServers[li].ip, sizeof(joinIP)-1);
+                joinIPLen = (int)strlen(joinIP);
+                joinIPFocus = false;
+            }
+        }
+        pthread_mutex_unlock(&lanMutex);
+
+        if(inRect(mx,my, BTN_X,(int)(cy-130), BTN_W,BTN_H)){
             isServer=false; joinFailed=false; joinTimer=0.0f;
             menuState=MENU_PLAYING;
         }
-        if(inRect(mx,my, BTN_X,cy-116, BTN_W,BTN_H)) menuState=MENU_MAIN;
+        if(inRect(mx,my, BTN_X,(int)(cy-180), BTN_W,BTN_H)) menuState=MENU_MAIN;
+
+    } else if(menuState==MENU_DEAD){
+        if(inRect(mx,my, BTN_X,(int)(resHeight/2.0f-20), BTN_W,BTN_H)){
+            menuState   = MENU_MAIN;
+            gameStarted = false;
+        }
     }
 }
 
@@ -3628,6 +6169,28 @@ void handleInput(XEvent *e){
     }
     if(e->type==KeyPress){
         KeySym k=XLookupKeysym(&e->xkey,0);
+
+        // Chat input intercepts all keys when open (in MENU_PLAYING)
+        if(chatOpen && menuState==MENU_PLAYING){
+            if(k==XK_Escape || k==XK_t || k==XK_T){
+                chatOpen = false;
+                chatInput[0]='\0'; chatInputLen=0;
+            } else if(k==XK_Return){
+                if(chatInputLen>0){ chatSend(chatInput); }
+                chatInput[0]='\0'; chatInputLen=0;
+                chatOpen = false;
+            } else if(k==XK_BackSpace){
+                if(chatInputLen>0){ chatInputLen--; chatInput[chatInputLen]='\0'; }
+            } else {
+                char buf[8]; int n=XLookupString(&e->xkey,buf,sizeof(buf),NULL,NULL);
+                if(n==1 && chatInputLen<CHAT_MSG_LEN-2){
+                    chatInput[chatInputLen++]=buf[0];
+                    chatInput[chatInputLen]='\0';
+                }
+            }
+            return;
+        }
+
         // IP text input when in JOIN menu
         if(menuState==MENU_JOIN && joinIPFocus){
             if(k==XK_BackSpace){
@@ -3647,14 +6210,22 @@ void handleInput(XEvent *e){
         if(k<65536) keys[k]=true;
         if(k==XK_Escape){
             if(menuState==MENU_PLAYING) menuState=MENU_MAIN;
+            else if(menuState==MENU_DEAD){ menuState=MENU_MAIN; gameStarted=false; }
             else running=false;
         }
+        if(k==XK_t || k==XK_T){
+            if(menuState==MENU_PLAYING && !chatOpen){
+                chatOpen=true; chatInput[0]='\0'; chatInputLen=0;
+            }
+        }
         if(k==XK_m || k==XK_M){ if(!mapKeyHeld){ mapOpen=!mapOpen; mapKeyHeld=true; } }
+        if(k==XK_v || k==XK_V) voiceTx = true;
     }
     if(e->type==KeyRelease){
         KeySym k=XLookupKeysym(&e->xkey,0);
         if(k<65536) keys[k]=false;
         if(k==XK_m || k==XK_M) mapKeyHeld=false;
+        if(k==XK_v || k==XK_V) voiceTx = false;
     }
 }
 
@@ -3667,9 +6238,34 @@ void gameLoop(){
     while(running){
         while(XPending(dpy)){ XNextEvent(dpy,&e); handleInput(&e); }
 
+        // Always tick LAN discovery + host broadcasts
+        updateLanServers(DT);
+        // Flush pending chat send (deferred because chatSend is defined before network globals)
+        if(chatHasPending){
+            chatHasPending = false;
+            int pkt[1 + CHAT_MSG_LEN/4 + 1];
+            pkt[0] = MSG_CHAT;
+            memset(pkt+1, 0, CHAT_MSG_LEN);
+            strncpy((char*)(pkt+1), chatPendingMsg, CHAT_MSG_LEN-1);
+            if((isServer&&clientConnected)||(!isServer&&seedReceived))
+                sendto(sockfd,(char*)pkt,sizeof(int)+CHAT_MSG_LEN,0,
+                       (struct sockaddr*)&otherAddr,sizeof(otherAddr));
+        }
+        if(gameStarted && isServer){
+            lanAnnounceTimer -= DT;
+            if(lanAnnounceTimer <= 0.0f){
+                lanBroadcastPresence();
+                lanAnnounceTimer = LAN_ANNOUNCE_INTERVAL;
+            }
+        }
+
         if(menuState != MENU_PLAYING){
             if(gameStarted){
-                // Paused: draw frozen world, then overlay menu, then present
+                // Dead state: keep animating explosions/tornados while frozen
+                if(menuState == MENU_DEAD){
+                    updateExplosions(DT);
+                    updateTornados(DT);
+                }
                 renderScene();
             } else {
                 glClearColor(0.04f,0.07f,0.13f,1.0f);
@@ -3710,11 +6306,16 @@ void gameLoop(){
             }
         }
 
+        gameTime += gameTimeSpeed * DT;
+        if(gameTime >= 1.0f) gameTime -= 1.0f;
         updateWeather(DT);
         updateTornados(DT);
         updateExplosions(DT);
-        updateDiveBombers(DT);
+        updateMissiles(DT);
+        updateNpcs(DT);
         updatePhysics(DT);
+        // Engine sound: on when in-plane and not dead
+        sndUpdateEngine(player.throttle, inPlane && menuState==MENU_PLAYING);
         renderScene();
         glXSwapBuffers(dpy,win);
         if(fpsCap > 0) usleep(1000000/fpsCap);
@@ -3733,7 +6334,6 @@ void initX11GL(){
     XMapWindow(dpy,win);
     glc = glXCreateContext(dpy,vi,NULL,GL_TRUE);
     glXMakeCurrent(dpy,win,glc);
-
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
@@ -3741,29 +6341,135 @@ void initX11GL(){
     glEnable(GL_TEXTURE_2D);
     glShadeModel(GL_SMOOTH);
 
-    // Sun direction (slightly from above-front)
-    GLfloat lightPos[]  = { 0.4f, 1.0f, 0.6f, 0.0f };  // directional
-    GLfloat ambient[]   = { 0.25f,0.25f,0.30f,1.0f };
-    GLfloat diffuse[]   = { 0.85f,0.82f,0.75f,1.0f };
-    GLfloat specular[]  = { 0.6f, 0.6f, 0.6f, 1.0f };
+    // Sun — position/colour updated dynamically each frame by updateSunLight()
+    // Set initial values so first frame isn't black
+    GLfloat lightPos[]  = { -0.3f, 0.8f, 0.5f, 0.0f };
+    GLfloat ambient[]   = { 0.15f, 0.18f, 0.22f, 1.0f };
+    GLfloat diffuse[]   = { 0.90f, 0.85f, 0.70f, 1.0f };
+    GLfloat specular[]  = { 0.70f, 0.65f, 0.55f, 1.0f };
     glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
     glLightfv(GL_LIGHT0, GL_AMBIENT,  ambient);
     glLightfv(GL_LIGHT0, GL_DIFFUSE,  diffuse);
     glLightfv(GL_LIGHT0, GL_SPECULAR, specular);
 
-    // Material specular response
-    GLfloat matSpec[] = { 0.5f,0.5f,0.5f,1.0f };
+    // Sky fill light (GL_LIGHT1): dim, from below — softens shadow side
+    glEnable(GL_LIGHT1);
+    GLfloat skyPos[]  = { 0.0f, -1.0f, 0.0f, 0.0f }; // from below (sky bounce)
+    GLfloat skyAmb[]  = { 0.0f,  0.0f, 0.0f, 1.0f };
+    GLfloat skyDiff[] = { 0.08f, 0.12f, 0.18f, 1.0f }; // cool blue fill
+    GLfloat skySpec[] = { 0.0f,  0.0f,  0.0f, 1.0f };
+    glLightfv(GL_LIGHT1, GL_POSITION, skyPos);
+    glLightfv(GL_LIGHT1, GL_AMBIENT,  skyAmb);
+    glLightfv(GL_LIGHT1, GL_DIFFUSE,  skyDiff);
+    glLightfv(GL_LIGHT1, GL_SPECULAR, skySpec);
+
+    // Material specular response — shinier metal
+    GLfloat matSpec[] = { 0.7f, 0.7f, 0.7f, 1.0f };
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR,  matSpec);
-    glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 48.0f);
+    glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 72.0f);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
 
     glClearColor(0.5f,0.8f,1.0f,1.0f);
     generateCheckerboardTexture();
+    generateBiomeTextures();
 }
 
 // -------- Network Init --------
 // serverPort: port the server listens on
 // clientPort: port the client binds to locally (must differ from serverPort on same machine)
+// -------- LAN Server Discovery --------
+// Host: broadcast "FLIGHTSIM_HOST" every 2s on LAN_DISCOVERY_PORT
+// Clients: listen on LAN_DISCOVERY_PORT, record source IPs, display in Join UI
+
+static void lanAddServer(const char *ip){
+    pthread_mutex_lock(&lanMutex);
+    // Update existing entry if already known
+    for(int i=0;i<numLanServers;i++){
+        if(strcmp(lanServers[i].ip, ip)==0){
+            lanServers[i].seenTimer = LAN_SERVER_TIMEOUT;
+            pthread_mutex_unlock(&lanMutex);
+            return;
+        }
+    }
+    if(numLanServers < MAX_LAN_SERVERS){
+        strncpy(lanServers[numLanServers].ip, ip, 63);
+        lanServers[numLanServers].ip[63] = '\0';
+        lanServers[numLanServers].seenTimer = LAN_SERVER_TIMEOUT;
+        numLanServers++;
+    }
+    pthread_mutex_unlock(&lanMutex);
+}
+
+static void* lanListenThreadFunc(void *arg){
+    (void)arg;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if(s < 0) return NULL;
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(LAN_DISCOVERY_PORT);
+    if(bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0){ close(s); return NULL; }
+    fcntl(s, F_SETFL, O_NONBLOCK);
+    lanSock = s;
+    char buf[64];
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+    while(lanThreadRunning){
+        int n = recvfrom(s, buf, sizeof(buf)-1, 0, (struct sockaddr*)&from, &fromlen);
+        if(n > 0){
+            buf[n] = '\0';
+            if(strncmp(buf, "FLIGHTSIM_HOST", 14)==0){
+                char fromIP[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &from.sin_addr, fromIP, sizeof(fromIP));
+                lanAddServer(fromIP);
+            }
+        }
+        usleep(50000); // 50ms poll
+    }
+    close(s);
+    lanSock = -1;
+    return NULL;
+}
+
+// Start the LAN listener (call once from main after GL context)
+static void startLanListener(){
+    lanThreadRunning = true;
+    pthread_create(&lanThread, NULL, lanListenThreadFunc, NULL);
+}
+
+// Called from game loop to broadcast presence when hosting
+static void lanBroadcastPresence(){
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if(s < 0) return;
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+    struct sockaddr_in dest = {0};
+    dest.sin_family      = AF_INET;
+    dest.sin_addr.s_addr = INADDR_BROADCAST;
+    dest.sin_port        = htons(LAN_DISCOVERY_PORT);
+    const char *msg = "FLIGHTSIM_HOST";
+    sendto(s, msg, strlen(msg), 0, (struct sockaddr*)&dest, sizeof(dest));
+    close(s);
+}
+
+// Tick LAN timers — call each frame (DT seconds)
+static void updateLanServers(float dt){
+    pthread_mutex_lock(&lanMutex);
+    for(int i=0;i<numLanServers;){
+        lanServers[i].seenTimer -= dt;
+        if(lanServers[i].seenTimer <= 0.0f){
+            // Remove by swapping with last
+            lanServers[i] = lanServers[--numLanServers];
+            if(selectedServer >= numLanServers) selectedServer = numLanServers-1;
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&lanMutex);
+}
+
 void initNetwork(const char* serverIp, int serverPort, int clientPort){
     sockfd = socket(AF_INET, SOCK_DGRAM,0);
     if(sockfd<0){ perror("socket"); exit(1);}
@@ -3808,23 +6514,29 @@ void startGame(){
         printf("[NET] Client: waiting for terrain seed from server...\n");
     }
 
-    player.x=0; player.y=airports[0].groundY+1.0f; player.z=0;
-    player.pitch=0; player.yaw=0; player.roll=0; player.throttle=0.0f; player.type=PLANE_FIGHTER;
-    onGround=true; airspeed=0.0f;
-    for(int i=0;i<MAX_ENEMIES;i++){
-        enemies[i].circleAngle = ((float)i/MAX_ENEMIES)*2.0f*(float)M_PI;
-        enemies[i].x     = player.x + cosf(enemies[i].circleAngle)*120.0f;
-        enemies[i].y     = player.y + 60.0f;
-        enemies[i].z     = player.z + sinf(enemies[i].circleAngle)*120.0f;
-        enemies[i].yaw   = enemies[i].circleAngle + (float)M_PI*0.5f;
-        enemies[i].pitch = 0.0f; enemies[i].roll = 0.2f;
-        enemies[i].speed = 12.0f;
-        enemies[i].state = DB_CIRCLE;
-        enemies[i].stateTimer = 2.0f + ((float)rand()/RAND_MAX)*4.0f;
-        enemies[i].alive = true;
+    // Spawn at runway threshold, facing down the runway
+    {
+        Airport *a0 = &airports[0];
+        // apLocalToWorld: world_x = wx + cos(h)*fwd, world_z = wz - sin(h)*fwd
+        // Threshold at local fwd = -runwayLen
+        float wx, wz;
+        apLocalToWorld(a0, -a0->runwayLen, 0.0f, &wx, &wz);
+        player.x   = wx;
+        player.z   = wz;
+        player.y   = a0->groundY + 1.0f;
+        // World velocity direction of local +fwd: vx=cos(h), vz=-sin(h)
+        // Yaw convention: vx=sin(yaw), vz=cos(yaw)
+        // => sin(yaw)=cos(h), cos(yaw)=-sin(h) => yaw = pi/2 - h
+        player.yaw = (float)M_PI*0.5f - a0->heading;
     }
-
+    player.pitch=0; player.roll=0; player.throttle=0.0f; player.type=PLANE_FIGHTER;
+    onGround=true; airspeed=0.0f;
+    sndInit();
     initWeather();
+    initClouds();
+    initTrees();
+    voiceInit();
+    voiceStart();
     initNetwork(joinIP, 5000, 5001);
 
     if(pthread_create(&netThread,NULL,networkThreadFunc,NULL)!=0){ perror("pthread_create"); exit(1); }
@@ -3842,10 +6554,14 @@ int main(){
     glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(60,(double)resWidth/resHeight,0.5,1200.0);
     glMatrixMode(GL_MODELVIEW);
 
+    startLanListener(); // background thread listens for LAN server announcements
+
     gameLoop();
 
     running=false;
     pthread_join(netThread,NULL);
+    lanThreadRunning=false;
+    pthread_join(lanThread,NULL);
 
     glXMakeCurrent(dpy,0,0); glXDestroyContext(dpy,glc); XDestroyWindow(dpy,win); XCloseDisplay(dpy);
     return 0;
