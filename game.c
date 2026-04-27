@@ -42,10 +42,10 @@
 // Turbulence is now dynamic — see turbulenceLevel global
 #define TURBULENCE_MAX 0.004f   // peak per-frame angular kick (was 0.01)
 #define GRAVITY 9.8f
-#define TERRAIN_SIZE 256       // grid cells per side (must be power-of-2)
-#define TERRAIN_SCALE 4.0f     // world units per cell => 1024x1024 world
-#define TERRAIN_HEIGHT 40.0f   // max terrain height
-#define MAX_AIRPORTS 12
+#define TERRAIN_SIZE 512       // grid cells per side (must be power-of-2)
+#define TERRAIN_SCALE 10.0f    // world units per cell => 5120x5120 world
+#define TERRAIN_HEIGHT 280.0f  // max terrain height — towering peaks
+#define MAX_AIRPORTS 24
 
 typedef enum { PLANE_FIGHTER=0, PLANE_PROP=1, PLANE_AIRLINER=2 } PlaneType;
 typedef struct {
@@ -54,9 +54,9 @@ typedef struct {
     const char *name;
 } PlaneStats;
 static const PlaneStats PLANE_DEFS[3] = {
-    /* FIGHTER  */ { 18.0f, 6.0f,  3.5f, 4.0f, 6.0f, 1.0f, "F/A-18 Hornet"   },
-    /* PROP     */ {  9.0f, 3.5f,  2.0f, 3.0f, 4.0f, 0.7f, "Cessna 172"      },
-    /* AIRLINER */ { 14.0f, 8.0f,  5.0f, 3.5f, 3.0f, 2.2f, "Boeing 737"      },
+    /* FIGHTER  */ { 80.0f, 18.0f, 8.0f,  10.0f, 28.0f, 1.0f, "F/A-18 Hornet"   },
+    /* PROP     */ { 35.0f,  9.0f, 4.5f,   7.0f, 14.0f, 0.7f, "Cessna 172"      },
+    /* AIRLINER */ { 60.0f, 22.0f, 12.0f,  8.0f, 12.0f, 2.2f, "Boeing 737"      },
 };
 
 typedef struct { float x,y,z; float vx,vy,vz; float pitch,yaw,roll; float throttle; PlaneType type; } Plane;
@@ -81,8 +81,14 @@ Airport airports[MAX_AIRPORTS];
 int numAirports = 0;
 
 // Parked planes at gates
-#define MAX_PARKED 20
-typedef struct { float wx,wy,wz, heading; bool active; PlaneType type; } ParkedPlane;
+#define MAX_PARKED 32
+#define PLANE_RESPAWN_TIME 60.0f   // seconds before an empty slot spawns a new plane
+typedef struct {
+    float wx,wy,wz, heading;
+    bool  active;
+    PlaneType type;
+    float respawnTimer;  // counts down; when <=0 and !active, spawn a new plane
+} ParkedPlane;
 ParkedPlane parkedPlanes[MAX_PARKED];
 int numParked = 0;
 
@@ -127,8 +133,14 @@ GLXContext glc;
 bool running=true;
 bool keys[65536];
 GLuint groundTexture;
-// Per-biome detail textures: 0=water 1=sand 2=grass 3=rock 4=snow
-#define NUM_BIOME_TEX 5
+// Mouse look
+static bool  mouseCaptured = false;
+static float mouseSensX    = 0.0015f;
+static float mouseSensY    = 0.0012f;
+static int   mouseWarpX, mouseWarpY; // window centre, set at game start
+// Per-biome detail textures:
+// 0=water 1=sand/desert 2=grass 3=rock 4=snow 5=tundra 6=wetland/marsh 7=canyon/red-rock
+#define NUM_BIOME_TEX 8
 static GLuint biomeTex[NUM_BIOME_TEX];
 
 // Landing gear
@@ -155,7 +167,7 @@ float walkerY      = 0.0f;
 float walkerZ      = 0.0f;
 float walkerYaw    = 0.0f;
 bool  enterKeyHeld = false;
-#define WALKER_SPEED   5.5f
+#define WALKER_SPEED   14.0f
 #define ENTER_DIST     6.0f   // max distance to enter a plane
 // Time of day (0=midnight, 0.25=dawn, 0.5=noon, 0.75=dusk, 1=midnight)
 static float gameTime = 0.35f;   // start near dawn
@@ -195,7 +207,7 @@ int   joinIPLen   = 9;
 bool  joinIPFocus = false;
 bool  joinFailed  = false;   // true when connect attempt timed out
 float joinTimer   = 0.0f;    // seconds since connect was clicked
-#define JOIN_TIMEOUT 5.0f    // seconds before showing "no server found"
+#define JOIN_TIMEOUT 15.0f   // seconds before showing "no server found" (allow internet latency)
 
 // ---- Text Chat ----
 #define CHAT_MAX_MSGS   20
@@ -275,7 +287,7 @@ static int         voiceBufHead    = 0;
 #define VOICE_HDR (sizeof(int)+sizeof(float)*3+sizeof(int))
 
 // ---- Trees ----
-#define MAX_TREES 3000
+#define MAX_TREES 18000
 typedef struct {
     float x, y, z;
     float h;          // height
@@ -286,7 +298,7 @@ static Tree  trees[MAX_TREES];
 static int   numTrees = 0;
 
 // ---- Clouds ----
-#define MAX_CLOUDS 80
+#define MAX_CLOUDS 500
 typedef struct {
     float x, y, z;          // world position
     float r;                 // puff radius
@@ -384,8 +396,9 @@ static bool  missileKeyHeld  = false;
 #define AL_SOURCE_STATE     0x1010
 #define AL_PLAYING          0x1012
 #define AL_LOOPING          0x1007
-#define AL_GAIN             0x100A
-#define AL_PITCH            0x1003
+#define AL_GAIN                 0x100A
+#define AL_PITCH                0x1003
+#define AL_BUFFERS_PROCESSED    0x1016
 #define AL_TRUE             1
 #define AL_FALSE            0
 #define ALC_DEFAULT_DEVICE_SPECIFIER 0x1004
@@ -410,6 +423,8 @@ static void       (*palSourcef)(ALuint,ALenum,ALfloat)   = NULL;
 static void       (*palSourcePlay)(ALuint)               = NULL;
 static void       (*palSourceStop)(ALuint)               = NULL;
 static void       (*palGetSourcei)(ALuint,ALenum,ALint*) = NULL;
+static void       (*palSourceQueueBuffers)(ALuint,ALint,const ALuint*) = NULL;
+static void       (*palSourceUnqueueBuffers)(ALuint,ALint,ALuint*)     = NULL;
 
 static bool alAvailable = false;
 
@@ -486,7 +501,9 @@ static void sndInit(){
     LOAD(palSourcef,           "alSourcef")
     LOAD(palSourcePlay,        "alSourcePlay")
     LOAD(palSourceStop,        "alSourceStop")
-    LOAD(palGetSourcei,        "alGetSourcei")
+    LOAD(palGetSourcei,            "alGetSourcei")
+    LOAD(palSourceQueueBuffers,    "alSourceQueueBuffers")
+    LOAD(palSourceUnqueueBuffers,  "alSourceUnqueueBuffers")
 #undef LOAD
     ALCdevice  *dev = palcOpenDevice(NULL);
     if(!dev){ fprintf(stderr,"[snd] alcOpenDevice failed\n"); return; }
@@ -614,8 +631,10 @@ static bool voiceInit(){
 static void voiceReceive(const char *buf, int n){
     if(!voiceReady || n < (int)VOICE_HDR) return;
     const char *p = buf + sizeof(int);
-    float rx2 = ((float*)p)[0], ry2 = ((float*)p)[1], rz2 = ((float*)p)[2];
-    p += sizeof(float)*3;
+    float rx2, ry2, rz2;
+    memcpy(&rx2, p,   sizeof(float)); p += sizeof(float);
+    memcpy(&ry2, p,   sizeof(float)); p += sizeof(float);
+    memcpy(&rz2, p,   sizeof(float)); p += sizeof(float);
     int payLen; memcpy(&payLen, p, sizeof(int)); p += sizeof(int);
     if(payLen <= 0 || payLen > VOICE_MAX_BYTES || n < (int)(VOICE_HDR+payLen)) return;
 
@@ -632,15 +651,30 @@ static void voiceReceive(const char *buf, int n){
                              pcmOut, VOICE_FRAME_SAMPLES, 0);
     if(frames <= 0) return;
 
-    if(!palBufferData || !palGenSources || !voiceSource) return;
+    if(!palBufferData || !palSourceQueueBuffers || !voiceSource) return;
+
+    // Dequeue any AL buffers the source has already finished playing.
+    {
+        ALint processed = 0;
+        palGetSourcei((ALuint)voiceSource, AL_BUFFERS_PROCESSED, &processed);
+        while(processed-- > 0){
+            ALuint tmp;
+            palSourceUnqueueBuffers((ALuint)voiceSource, 1, &tmp);
+        }
+    }
+
     ALuint vbuf = (ALuint)voiceBuffers[voiceBufHead % 8];
     voiceBufHead++;
     palBufferData(vbuf, AL_FORMAT_MONO16, pcmOut, frames*2, VOICE_SAMPLE_RATE);
-    void (*pSourceQueueBuffers)(ALuint,ALint,const ALuint*) =
-        dlsym(RTLD_DEFAULT,"alSourceQueueBuffers");
-    if(pSourceQueueBuffers) pSourceQueueBuffers((ALuint)voiceSource, 1, &vbuf);
+    palSourceQueueBuffers((ALuint)voiceSource, 1, &vbuf);
     if(palSourcef)  palSourcef((ALuint)voiceSource, AL_GAIN, gain*0.9f);
-    if(palSourcePlay) palSourcePlay((ALuint)voiceSource);
+    // Only call Play if not already playing (re-starting a playing streaming source
+    // resets the queue position).
+    {
+        ALint state = 0;
+        palGetSourcei((ALuint)voiceSource, AL_SOURCE_STATE, &state);
+        if(state != AL_PLAYING) palSourcePlay((ALuint)voiceSource);
+    }
 }
 
 static void* voiceCapThreadFunc(void *arg){
@@ -787,6 +821,7 @@ pthread_mutex_t remoteMutex = PTHREAD_MUTEX_INITIALIZER;
 int sockfd;
 struct sockaddr_in otherAddr;
 bool isServer = true;
+static char localIP[64] = "?.?.?.?";  // populated at network init
 bool clientConnected = false;  // server-side: tracks if a client addr is known
 int packetsSent = 0, packetsRecv = 0;
 unsigned int terrainSeed = 0;  // server picks this; client receives it
@@ -1592,6 +1627,47 @@ static void drawAirliner(float gear){
     }
 }
 
+// Draw a nav/strobe light glow at local position (lx,ly,lz) with given colour and radius.
+static void drawNavLight(float lx, float ly, float lz,
+                         float r, float g, float b, float radius){
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glColor4f(r, g, b, 0.85f);
+    glBegin(GL_TRIANGLE_FAN);
+        glVertex3f(lx, ly, lz);
+        for(int i=0;i<=10;i++){
+            float a = i * 6.28318f / 10.0f;
+            glVertex3f(lx + cosf(a)*radius, ly + sinf(a)*radius, lz);
+        }
+    glEnd();
+    glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+}
+
+// Draw a full set of nav+strobe+beacon lights in the current model-local space.
+// wingtipX: half-span (lights at ±wingtipX, wingtipY, wingtipZ)
+// tailZ: −Z position of white tail light
+// topY: Y of red rotating beacon
+static void drawPlaneNavLights(float wingtipX, float wingtipY, float wingtipZ,
+                                float tailZ, float topY){
+    float t = (float)clock() / (float)CLOCKS_PER_SEC;
+    // Steady nav: red left, green right
+    drawNavLight(-wingtipX, wingtipY, wingtipZ,  1.0f, 0.05f, 0.05f, 0.06f);
+    drawNavLight( wingtipX, wingtipY, wingtipZ,  0.05f, 1.0f, 0.05f, 0.06f);
+    // White tail light
+    drawNavLight(0.0f, 0.0f, tailZ,  1.0f, 1.0f, 1.0f, 0.05f);
+    // Strobe: sharp 60ms flash every 1.5s on each wingtip and tail
+    float strobe = fmodf(t, 1.5f);
+    if(strobe < 0.06f){
+        float si = 1.0f - strobe/0.06f;
+        drawNavLight(-wingtipX, wingtipY, wingtipZ, si, si, si, 0.12f);
+        drawNavLight( wingtipX, wingtipY, wingtipZ, si, si, si, 0.12f);
+        drawNavLight(0.0f, 0.0f, tailZ,             si, si, si, 0.10f);
+    }
+    // Red anti-collision beacon: pulses at ~1 Hz on top of fuselage
+    float beacon = 0.5f + 0.5f*sinf(t * 6.28318f * 1.0f);
+    drawNavLight(0.0f, topY, 0.0f,  1.0f, 0.05f, 0.05f, 0.05f + beacon*0.07f);
+}
+
 void drawPlaneModel(float x,float y,float z,float pitch,float yaw,float roll,float gear,PlaneType type){
     glPushMatrix();
     glTranslatef(x,y,z);
@@ -1600,8 +1676,16 @@ void drawPlaneModel(float x,float y,float z,float pitch,float yaw,float roll,flo
     glRotatef(roll*57.2958f,0,0,1);
     float sc = PLANE_DEFS[type].scale;
     glScalef(sc,sc,sc);
-    if(type==PLANE_PROP){ drawPropPlane(gear); glPopMatrix(); return; }
-    if(type==PLANE_AIRLINER){ drawAirliner(gear); glPopMatrix(); return; }
+    if(type==PLANE_PROP){
+        drawPropPlane(gear);
+        drawPlaneNavLights(1.20f, 0.0f, 0.0f, -1.10f, 0.55f);
+        glPopMatrix(); return;
+    }
+    if(type==PLANE_AIRLINER){
+        drawAirliner(gear);
+        drawPlaneNavLights(2.20f, 0.0f, -0.10f, -2.20f, 0.70f);
+        glPopMatrix(); return;
+    }
 
     // ---- FUSELAGE (octagonal cross-section, 6 segments) ----
     glColor3f(0.62f,0.63f,0.68f);
@@ -2091,6 +2175,9 @@ void drawPlaneModel(float x,float y,float z,float pitch,float yaw,float roll,flo
         glPopMatrix();
     }
 
+    // ---- NAV / STROBE / BEACON LIGHTS ----
+    drawPlaneNavLights(1.55f, -0.05f, -0.28f, -1.30f, 0.32f);
+
     glPopMatrix();
 }
 
@@ -2140,13 +2227,13 @@ static float fbm(float x, float z, int octaves){
 // Phase 1: Diamond-Square base only. Leaves terrainH with low-frequency
 // height values that airports can safely sample and flatten before detail is added.
 static void generateTerrainBase(){
-    terrainH[0][0]       = TERRAIN_HEIGHT*0.25f;
-    terrainH[0][TN-1]    = TERRAIN_HEIGHT*0.35f;
-    terrainH[TN-1][0]    = TERRAIN_HEIGHT*0.30f;
-    terrainH[TN-1][TN-1] = TERRAIN_HEIGHT*0.40f;
+    terrainH[0][0]       = TERRAIN_HEIGHT*0.40f;
+    terrainH[0][TN-1]    = TERRAIN_HEIGHT*0.55f;
+    terrainH[TN-1][0]    = TERRAIN_HEIGHT*0.50f;
+    terrainH[TN-1][TN-1] = TERRAIN_HEIGHT*0.60f;
 
-    // Lower roughness = gentler hills, fewer extreme peaks
-    float roughness = 0.50f, scale = TERRAIN_HEIGHT;
+    // Higher roughness = dramatic peaks and deep valleys, jurassic style
+    float roughness = 0.68f, scale = TERRAIN_HEIGHT;
     for(int step=TERRAIN_SIZE; step>1; step/=2){
         int half=step/2; scale*=roughness;
         for(int y=0;y<TERRAIN_SIZE;y+=step)
@@ -2206,13 +2293,31 @@ static void generateTerrainDetail(){
     for(int z=0;z<TN;z++)
         for(int x=0;x<TN;x++){
             float fx=(float)x/TERRAIN_SIZE, fz=(float)z/TERRAIN_SIZE;
-            // Gentle rolling hills (softer ridge, reduced contribution vs before)
-            float ridge = fbm(fx*3.0f, fz*3.0f, 4);
-            ridge = 1.0f - fabsf(ridge);  // ridge-ify
-            ridge = ridge * ridge * 0.5f; // weaker than before (was *1.0, now *0.5)
-            // Fine surface bumps
-            float detail = fbm(fx*14.0f, fz*14.0f, 3) * 0.4f;
-            terrainH[z][x] += ridge * TERRAIN_HEIGHT * 0.25f + detail * 1.5f;
+            // Regional mountain mask — low-frequency noise decides where mountains appear.
+            // mountainMask near 0 = flat plains/valleys, near 1 = full mountain range.
+            float mountainMask = fbm(fx*1.1f + 7.7f, fz*1.1f + 3.3f, 3);
+            mountainMask = clampf((mountainMask - 0.35f) * 2.5f, 0.0f, 1.0f);
+            mountainMask = mountainMask * mountainMask; // sharpen transition
+
+            // Jurassic ridge spines, only in mountain regions
+            float ridge = fbm(fx*3.5f, fz*3.5f, 6);
+            ridge = 1.0f - fabsf(ridge * 2.0f - 1.0f);
+            ridge = ridge * ridge * ridge;
+            float ridge2 = fbm(fx*2.1f + 5.3f, fz*1.7f + 2.9f, 4);
+            ridge2 = 1.0f - fabsf(ridge2);
+            ridge2 = ridge2 * ridge2 * 0.4f;
+
+            // Gentle rolling hills everywhere (low amplitude)
+            float rolling = fbm(fx*2.0f + 1.1f, fz*2.0f + 8.5f, 4);
+            rolling = rolling * rolling * 0.3f;
+
+            // Fine surface texture everywhere
+            float detail = fbm(fx*18.0f, fz*18.0f, 4) * 0.6f;
+
+            terrainH[z][x] += mountainMask * (ridge * TERRAIN_HEIGHT * 0.65f
+                                            + ridge2 * TERRAIN_HEIGHT * 0.25f)
+                            + (1.0f - mountainMask) * rolling * TERRAIN_HEIGHT * 0.18f
+                            + detail * 4.0f;
             terrainH[z][x]  = clampf(terrainH[z][x], 0.0f, TERRAIN_HEIGHT);
         }
 
@@ -2278,21 +2383,55 @@ static void bakeTerrainColors(){
             float ny = terrainNY[z][x];
             float slope = 1.0f - ny;
             float t = h2 / TERRAIN_HEIGHT;
+
+            // Spatial biome selector: low-frequency noise to create region variety
+            float wx2 = (x - TERRAIN_SIZE*0.5f) * TERRAIN_SCALE;
+            float wz2 = (z - TERRAIN_SIZE*0.5f) * TERRAIN_SCALE;
+            float bx = wx2 / (TERRAIN_SIZE * TERRAIN_SCALE * 0.5f); // -1..1
+            float bz = wz2 / (TERRAIN_SIZE * TERRAIN_SCALE * 0.5f);
+            float biomeNoise = fbm(bx*1.8f + 3.3f, bz*1.8f + 1.7f, 3); // 0..1
+
             float r,g,b;
             int biome;
-            if(t < 0.03f){      r=0.15f; g=0.28f; b=0.62f; biome=0; } // water
-            else if(t < 0.07f){ r=0.76f; g=0.70f; b=0.50f; biome=1; } // sand
-            else if(t < 0.35f){ r=0.22f; g=0.50f; b=0.16f; biome=2; } // grass
-            else if(t < 0.60f){ r=0.28f; g=0.43f; b=0.18f; biome=2; } // highland grass
-            else if(t < 0.78f){ r=0.50f; g=0.46f; b=0.38f; biome=3; } // rock
-            else {              r=0.88f; g=0.90f; b=0.93f; biome=4; } // snow
-            if(slope > 0.3f){
-                float blend = clampf((slope-0.3f)/0.35f, 0.0f, 1.0f);
+
+            if(t < 0.03f){
+                // Water
+                r=0.15f; g=0.28f; b=0.62f; biome=0;
+            } else if(t < 0.07f){
+                // Shoreline — sand or muddy wetland by region
+                if(biomeNoise > 0.55f){ r=0.55f; g=0.60f; b=0.45f; biome=6; } // wetland shore
+                else                  { r=0.76f; g=0.70f; b=0.50f; biome=1; } // sand shore
+            } else if(t < 0.12f){
+                // Low flat — desert, wetland, or grass by region
+                if(biomeNoise < 0.28f){      r=0.80f; g=0.68f; b=0.42f; biome=1; } // desert/sand
+                else if(biomeNoise < 0.48f){ r=0.48f; g=0.58f; b=0.34f; biome=6; } // wetland
+                else {                       r=0.22f; g=0.50f; b=0.16f; biome=2; } // grass
+            } else if(t < 0.38f){
+                // Mid elevations — grass, canyon, or tundra
+                if(biomeNoise < 0.30f){      r=0.72f; g=0.42f; b=0.22f; biome=7; } // canyon/desert
+                else if(biomeNoise > 0.72f){ r=0.50f; g=0.55f; b=0.42f; biome=5; } // tundra
+                else {                       r=0.22f; g=0.50f; b=0.16f; biome=2; } // grass
+            } else if(t < 0.62f){
+                // Highland — grass fading to rock, or canyon walls
+                if(biomeNoise < 0.32f){ r=0.65f; g=0.38f; b=0.20f; biome=7; } // canyon wall
+                else {                  r=0.28f; g=0.43f; b=0.18f; biome=2; } // highland grass
+            } else if(t < 0.80f){
+                // Rock zone
+                r=0.50f; g=0.46f; b=0.38f; biome=3;
+            } else {
+                // Snow caps
+                r=0.88f; g=0.90f; b=0.93f; biome=4;
+            }
+
+            // Steep slopes always become rock regardless of biome
+            if(slope > 0.30f){
+                float blend = clampf((slope-0.30f)/0.35f, 0.0f, 1.0f);
                 r=r*(1-blend)+0.48f*blend;
                 g=g*(1-blend)+0.44f*blend;
                 b=b*(1-blend)+0.37f*blend;
-                if(blend > 0.5f) biome=3; // steep = rock
+                if(blend > 0.5f) biome=3;
             }
+
             terrainCR[z][x]=(unsigned char)(r*255);
             terrainCG[z][x]=(unsigned char)(g*255);
             terrainCB[z][x]=(unsigned char)(b*255);
@@ -2387,6 +2526,7 @@ static void spawnParkedPlanesForAirport(const Airport *ap){
         // Assign type: large airports get a mix including airliners; small = prop or fighter
         int r = rand() % (ap->size == 2 ? 3 : (ap->size == 1 ? 2 : 2));
         pp->type = (PlaneType)r;
+        pp->respawnTimer = 0.0f;
     }
 }
 
@@ -2894,7 +3034,7 @@ void renderAirport(const Airport *ap){
             glEnd();
             // glow halo (additive blend)
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glDisable(GL_LIGHTING);
             glColor4f(1.0f, 0.85f, 0.1f, 0.35f);
             float hr = 0.5f;
             glBegin(GL_TRIANGLE_FAN);
@@ -2902,7 +3042,7 @@ void renderAirport(const Airport *ap){
                 for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
                     glVertex3f(fwd+0.03f+cosf(ga)*hr, 0.55f+sinf(ga)*hr*0.4f, sz+sinf(ga)*hr); }
             glEnd();
-            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING); glDisable(GL_BLEND);
         }
     }
 
@@ -2912,37 +3052,61 @@ void renderAirport(const Airport *ap){
             float sz = s*(rw*0.7f);
             float fx = end*rl;
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glDisable(GL_LIGHTING);
             glColor4f(1.0f, 0.1f, 0.05f, 0.6f);
             glBegin(GL_TRIANGLE_FAN);
                 glVertex3f(fx, 0.6f, sz);
                 for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
                     glVertex3f(fx+cosf(ga)*0.5f, 0.6f+sinf(ga)*0.3f, sz+sinf(ga)*0.5f); }
             glEnd();
-            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING); glDisable(GL_BLEND);
         }
     }
 
     // ---- PAPI (Precision Approach Path Indicator) — left side of threshold ----
-    // 4 lights in a row: red/white based on glidepath (just show all as fixed colours)
+    // Calibration angles (degrees): light 0=outermost=highest, light 3=innermost=lowest.
+    // White when above calibration angle, red when below.
+    // Standard 3-deg path: all white=too high, 2W2R=on glidepath, all red=too low.
     {
-        float papiX = rl - 5.0f;  // near threshold
+        static const float papiAngles[4] = { 4.5f, 3.5f, 2.5f, 2.0f };
+        float papiX = rl - 5.0f;
         float papiZ = -(rw + 3.5f);
+
+        // Transform player world pos into airport local coords to get elevation angle.
+        // Airport local: c = cos(heading), s = sin(heading)
+        // world->local: fwd = c*(px-apx) - s*(pz-apz), but we only need horizontal
+        // distance from the PAPI threshold position to the player.
+        // Convert PAPI local position to world for the distance calc.
+        float ch = cosf(ap->heading), sh = sinf(ap->heading);
+        // PAPI centre local = (papiX, 0.5, papiZ)
+        float papiWX = ap->wx + ch*papiX + sh*papiZ;
+        float papiWZ = ap->wz - sh*papiX + ch*papiZ;
+        float papiWY = ap->groundY + 0.5f;
+
+        float dX = player.x - papiWX;
+        float dZ = player.z - papiWZ;
+        float horizDist = sqrtf(dX*dX + dZ*dZ);
+        float elevAngleDeg = 0.0f;
+        if(horizDist > 5.0f){
+            elevAngleDeg = atan2f(player.y - papiWY, horizDist) * 57.2958f;
+        }
+
         for(int p=0;p<4;p++){
             float pz2 = papiZ - p*2.2f;
-            // alternate red/white to indicate ~3-deg glidepath at centre
-            float pr = (p < 2) ? 1.0f : 0.95f;
-            float pg = (p < 2) ? 0.05f : 0.95f;
-            float pb = (p < 2) ? 0.05f : 0.95f;
+            // White if player is above this light's calibration angle, red if below.
+            int isWhite = (elevAngleDeg >= papiAngles[p]);
+            float pr = isWhite ? 0.95f : 1.0f;
+            float pg = isWhite ? 0.95f : 0.05f;
+            float pb = isWhite ? 0.90f : 0.05f;
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
-            glColor4f(pr, pg, pb, 0.7f);
+            glDisable(GL_LIGHTING);
+            glColor4f(pr, pg, pb, 0.85f);
             glBegin(GL_TRIANGLE_FAN);
                 glVertex3f(papiX, 0.5f, pz2);
                 for(int gi=0;gi<=8;gi++){ float ga=gi*6.28318f/8;
                     glVertex3f(papiX+cosf(ga)*0.4f, 0.5f+sinf(ga)*0.25f, pz2+sinf(ga)*0.4f); }
             glEnd();
-            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING); glDisable(GL_BLEND);
         }
     }
 
@@ -2954,14 +3118,14 @@ void renderAirport(const Airport *ap){
             for(int side=0;side<2;side++){
                 float sz = (side==0) ? twInner-0.3f : twOuter+0.3f;
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glDisable(GL_LIGHTING);
                 glColor4f(0.15f, 0.35f, 1.0f, 0.45f);
                 glBegin(GL_TRIANGLE_FAN);
                     glVertex3f(fx, 0.4f, sz);
                     for(int gi=0;gi<=6;gi++){ float ga=gi*6.28318f/6;
                         glVertex3f(fx+cosf(ga)*0.3f, 0.4f, sz+sinf(ga)*0.3f); }
                 glEnd();
-                glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+                glEnable(GL_LIGHTING); glDisable(GL_BLEND);
             }
         }
     }
@@ -2983,14 +3147,14 @@ void renderAirport(const Airport *ap){
             glEnd();
             // Flood glow
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+            glDisable(GL_LIGHTING);
             glColor4f(1.0f, 0.97f, 0.88f, 0.30f);
             glBegin(GL_TRIANGLE_FAN);
                 glVertex3f(fx+0.06f, 6.6f, fz);
                 for(int gi=0;gi<=10;gi++){ float ga=gi*6.28318f/10;
                     glVertex3f(fx+0.06f+cosf(ga)*1.5f, 6.6f+sinf(ga)*0.5f, fz+sinf(ga)*1.5f); }
             glEnd();
-            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING); glDisable(GL_BLEND);
         }
     }
 
@@ -3004,7 +3168,7 @@ void renderAirport(const Airport *ap){
         float bx2 = tx2 + cosf(beaconAngle)*2.5f;
         float bz2 = bz  + sinf(beaconAngle)*2.5f;
         glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-        glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+        glDisable(GL_LIGHTING);
         // White flash
         glColor4f(1.0f, 1.0f, 1.0f, 0.70f);
         glBegin(GL_TRIANGLE_FAN);
@@ -3019,7 +3183,7 @@ void renderAirport(const Airport *ap){
             for(int gi=0;gi<=10;gi++){ float ga=gi*6.28318f/10;
                 glVertex3f(bx2+cosf(ga)*1.5f, beaconY, bz2+sinf(ga)*1.5f); }
         glEnd();
-        glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glDisable(GL_BLEND);
+        glEnable(GL_LIGHTING); glDisable(GL_BLEND);
     }
 
     glPopMatrix();
@@ -3237,6 +3401,53 @@ static void generateBiomeTextures(){
     }
     UPLOAD_TEX(4)
 
+    // 5 — Tundra: pale grey-green mossy permafrost with frost crack patterns
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*12.0f, fz=z/(float)BTEX_SIZE*12.0f;
+        float base  = btexFbm(fx,fz,5,6001);
+        float frost  = btexFbm(fx*3,fz*3,4,6101);
+        float crackV = fabsf(btexFbm(fx*2,fz*0.5f,4,6201)*2-1);
+        float crackH = fabsf(btexFbm(fx*0.5f,fz*2,4,6301)*2-1);
+        float crack = 1.0f - clampf((crackV<crackH?crackV:crackH)*5.0f,0,1);
+        float v = 0.52f + base*0.22f + frost*0.08f - crack*0.12f;
+        buf[z][x][0]=(unsigned char)clampf(v*145,0,255);
+        buf[z][x][1]=(unsigned char)clampf(v*158,0,255);
+        buf[z][x][2]=(unsigned char)clampf(v*138,0,255);
+    }
+    UPLOAD_TEX(5)
+
+    // 6 — Wetland/Marsh: dark muddy green with standing water patches
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*10.0f, fz=z/(float)BTEX_SIZE*10.0f;
+        float mud   = btexFbm(fx,fz,5,7001);
+        float water = btexFbm(fx*0.6f,fz*0.6f,4,7101);
+        float algae = btexFbm(fx*2,fz*2,4,7201);
+        float wetAmt= clampf((1.0f-water)*1.5f,0,1);
+        float v = 0.38f + mud*0.18f + algae*0.12f;
+        // Dark muddy green, puddles are darker blue-grey
+        float dr=v*58, dg=v*82, db=v*44;
+        float wr=v*42, wg=v*55, wb=v*68;
+        buf[z][x][0]=(unsigned char)clampf(dr*(1-wetAmt)+wr*wetAmt,0,255);
+        buf[z][x][1]=(unsigned char)clampf(dg*(1-wetAmt)+wg*wetAmt,0,255);
+        buf[z][x][2]=(unsigned char)clampf(db*(1-wetAmt)+wb*wetAmt,0,255);
+    }
+    UPLOAD_TEX(6)
+
+    // 7 — Canyon/Red-rock: deep red sandstone with layered strata lines
+    for(int z=0;z<BTEX_SIZE;z++) for(int x=0;x<BTEX_SIZE;x++){
+        float fx=x/(float)BTEX_SIZE*16.0f, fz=z/(float)BTEX_SIZE*16.0f;
+        float base  = btexFbm(fx,fz,5,8001);
+        // Horizontal strata banding
+        float strata = 0.5f+0.5f*sinf(fz*8.0f + base*3.0f);
+        float grain  = btexFbm(fx*4,fz*4,4,8101);
+        float v = 0.55f + base*0.20f + strata*0.15f + grain*0.08f;
+        // Red-orange sandstone palette
+        buf[z][x][0]=(unsigned char)clampf(v*210,0,255);
+        buf[z][x][1]=(unsigned char)clampf(v*110 + strata*20,0,255);
+        buf[z][x][2]=(unsigned char)clampf(v*55,0,255);
+    }
+    UPLOAD_TEX(7)
+
 #undef UPLOAD_TEX
     glBindTexture(GL_TEXTURE_2D,0);
 }
@@ -3259,10 +3470,11 @@ void renderFPS() {
 void* networkThreadFunc(void* arg){
     while(running){
         // Receive data first so server can learn client address before sending
-        char buffer[256]; struct sockaddr_in from; socklen_t fromlen=sizeof(from); int n;
+        char buffer[512]; struct sockaddr_in from; socklen_t fromlen=sizeof(from); int n;
         while((n=recvfrom(sockfd,buffer,sizeof(buffer),0,(struct sockaddr*)&from,&fromlen))>0){
-            int *recvType=(int*)buffer;
-            if(*recvType==MSG_CONNECT){
+            if(n < (int)sizeof(int)) continue;
+            int recvType; memcpy(&recvType, buffer, sizeof(int));
+            if(recvType==MSG_CONNECT){
                 printf("[LOG] A player connected from %s:%d!\n",
                     inet_ntoa(from.sin_addr), ntohs(from.sin_port));
                 if(isServer){
@@ -3275,20 +3487,19 @@ void* networkThreadFunc(void* arg){
                     memcpy(seedPkt+sizeof(int), &terrainSeed, sizeof(unsigned int));
                     sendto(sockfd,seedPkt,sizeof(seedPkt),0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
                 }
-            } else if(*recvType==MSG_TERRAIN_SEED && n==(int)(sizeof(int)+sizeof(unsigned int))){
+            } else if(recvType==MSG_TERRAIN_SEED && n==(int)(sizeof(int)+sizeof(unsigned int))){
                 if(!isServer && !seedReceived){
                     unsigned int seed;
                     memcpy(&seed, buffer+sizeof(int), sizeof(unsigned int));
-                    printf("[NET] Received terrain seed %u from server — regenerating terrain\n", seed);
+                    printf("[NET] Received terrain seed %u from server\n", seed);
                     generateAllTerrain(seed);
                     seedReceived = true;
-                    // Reset player to first airport after terrain regenerates
                     pthread_mutex_lock(&playerMutex);
                     player.x=0; player.y=airports[0].groundY+1.0f; player.z=0;
                     player.pitch=0; player.yaw=0; player.roll=0;
                     pthread_mutex_unlock(&playerMutex);
                 }
-            } else if(*recvType==MSG_TORNADO && n==(int)(sizeof(int)+sizeof(int)+MAX_TORNADOS*(int)(sizeof(float)*4))){
+            } else if(recvType==MSG_TORNADO && n==(int)(sizeof(int)+sizeof(int)+MAX_TORNADOS*(int)(sizeof(float)*4))){
                 if(!isServer){
                     char *p = buffer+sizeof(int);
                     int enabled; memcpy(&enabled,p,sizeof(int)); p+=sizeof(int);
@@ -3303,9 +3514,9 @@ void* networkThreadFunc(void* arg){
                     }
                     pthread_mutex_unlock(&tornadoMutex);
                 }
-            } else if(*recvType==MSG_PLAYER_DATA && n==(int)(sizeof(int)+sizeof(float)*14)){
-                // x,y,z,pitch,yaw,roll,throttle, walkerX,walkerY,walkerZ,walkerYaw, inPlane,type,isPassenger
-                float *rdata=(float*)(buffer+sizeof(int));
+            } else if(recvType==MSG_PLAYER_DATA && n==(int)(sizeof(int)+sizeof(float)*14)){
+                float rdata[14];
+                memcpy(rdata, buffer+sizeof(int), sizeof(rdata));
                 pthread_mutex_lock(&remoteMutex);
                 remotePlayers[0].x=rdata[0]; remotePlayers[0].y=rdata[1]; remotePlayers[0].z=rdata[2];
                 remotePlayers[0].pitch=rdata[3]; remotePlayers[0].yaw=rdata[4]; remotePlayers[0].roll=rdata[5];
@@ -3318,21 +3529,21 @@ void* networkThreadFunc(void* arg){
                 remotePlayers[0].alive=true;
                 pthread_mutex_unlock(&remoteMutex);
                 packetsRecv++;
-            } else if(*recvType==MSG_EXPLOSION && n==(int)(sizeof(int)+sizeof(float)*4)){
-                float *ed=(float*)(buffer+sizeof(int));
+            } else if(recvType==MSG_EXPLOSION && n==(int)(sizeof(int)+sizeof(float)*4)){
+                float ed[4]; memcpy(ed, buffer+sizeof(int), sizeof(ed));
                 receiveExplosion(ed[0],ed[1],ed[2],ed[3]);
                 if(isServer && clientConnected)
                     sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
-            } else if(*recvType==MSG_VOICE && n>(int)VOICE_HDR){
+            } else if(recvType==MSG_VOICE && n>(int)VOICE_HDR){
                 voiceReceive(buffer, n);
                 if(isServer && clientConnected)
                     sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
-            } else if(*recvType==MSG_CHAT && n>=(int)(sizeof(int)+1)){
-                char msgbuf[CHAT_MSG_LEN+8];
-                const char *raw = buffer+sizeof(int);
+            } else if(recvType==MSG_CHAT && n>=(int)(sizeof(int)+1)){
+                char msgbuf[CHAT_MSG_LEN+16];
                 int rawlen = n-sizeof(int);
                 if(rawlen >= CHAT_MSG_LEN) rawlen = CHAT_MSG_LEN-1;
-                snprintf(msgbuf, sizeof(msgbuf), "[remote] %.*s", rawlen, raw);
+                char raw[CHAT_MSG_LEN]; memcpy(raw, buffer+sizeof(int), rawlen); raw[rawlen]='\0';
+                snprintf(msgbuf, sizeof(msgbuf), "[remote] %s", raw);
                 chatAddMsg(msgbuf);
                 if(isServer && clientConnected)
                     sendto(sockfd,buffer,n,0,(struct sockaddr*)&otherAddr,sizeof(otherAddr));
@@ -3404,7 +3615,7 @@ static void weatherPreset(WeatherType t, float *skyR, float *skyG, float *skyB,
     switch(t){
         case WX_CLEAR:
             *skyR=0.50f; *skyG=0.78f; *skyB=1.00f;
-            *fog=0.0006f; *rain=0.0f;
+            *fog=0.0003f; *rain=0.0f;
             spd=((float)rand()/RAND_MAX)*1.5f;
             break;
         case WX_CLOUDY:
@@ -3424,7 +3635,7 @@ static void weatherPreset(WeatherType t, float *skyR, float *skyG, float *skyB,
             break;
         default:
             *skyR=0.5f; *skyG=0.78f; *skyB=1.0f;
-            *fog=0.0006f; *rain=0.0f; spd=0; break;
+            *fog=0.0003f; *rain=0.0f; spd=0; break;
     }
     *wX = cosf(h)*spd;
     *wZ = sinf(h)*spd;
@@ -3980,6 +4191,613 @@ static void renderMap(){
 #undef W2MY
 }
 
+// -------- Retail / Fast Food Buildings --------
+typedef enum { STORE_ALBERTSONS=0, STORE_ARBYS=1, STORE_LJS=2 } StoreType;
+#define MAX_STORES 48
+#define STORE_ENTER_DIST 8.0f
+
+// Store interior is a rectangle in local space: X ±SW_HALF, Z -SD_BACK..SD_FRONT
+#define SW_HALF  10.0f   // half-width
+#define SD_BACK  14.0f   // depth behind counter
+#define SD_FRONT  5.0f   // depth in front of counter (toward door)
+#define SWALL_THICK 0.3f // collision margin from walls
+#define SCEIL    4.0f    // ceiling height
+#define SDOOR_Z  (SD_FRONT - 0.5f)   // door local Z
+#define SCOUNTER_Z (-2.5f)            // front face of counter
+
+typedef struct {
+    float wx, wy, wz;
+    float heading;
+    StoreType type;
+} Store;
+static Store     stores[MAX_STORES];
+static int       numStores    = 0;
+static int       inStoreIdx   = -1;          // -1 = outside
+static StoreType lastStoreType = STORE_ALBERTSONS; // type of last visited store
+// Walker's position inside the store, in store-local coords
+static float storeWalkerX = 0.0f;
+static float storeWalkerZ = SDOOR_Z - 1.0f;
+static float storeWalkerYaw = (float)M_PI;  // faces counter (toward -Z)
+
+// Inventory: up to 5 slots per store type, count of each item held
+#define INV_SLOTS 5
+static int   inventory[INV_SLOTS] = {0,0,0,0,0};
+
+// Active consumable effects
+static float effectSpeed    = 0.0f;  // extra speed multiplier, decays
+static float effectSpeedTimer = 0.0f;
+static float effectHeal     = 0.0f;  // heal rate per second, decays
+static float effectHealTimer  = 0.0f;
+static float playerHealth   = 1.0f;  // 0..1
+
+// Item effect types
+typedef enum { EFF_NONE, EFF_HEAL, EFF_SPEED, EFF_HEALSPD } EffectType;
+typedef struct {
+    const char *label;        // menu display
+    const char *buyMsg;       // cashier response on purchase
+    const char *useMsg;       // message when consumed
+    EffectType  effect;
+    float       effectMag;    // strength (heal: hp/s, speed: multiplier)
+    float       effectDur;    // seconds
+} MenuItem;
+
+static const MenuItem menuAlbertsons[INV_SLOTS] = {
+    {"1) Deli Sandwich       $6.99",  "Here's your sandwich, freshly made!",
+     "Ate the sandwich. Feeling better!",    EFF_HEAL,   0.05f, 8.0f},
+    {"2) Rotisserie Chicken  $7.99",  "Hot rotisserie chicken — enjoy!",
+     "Devoured the chicken. Full heal!",     EFF_HEAL,   0.12f, 12.0f},
+    {"3) House Salad         $4.49",  "One salad coming right up!",
+     "Ate the salad. Light but nourishing.", EFF_HEAL,   0.03f, 6.0f},
+    {"4) Bakery Croissant    $2.29",  "Still warm from the oven!",
+     "Croissant eaten. Sugar rush!",         EFF_SPEED,  0.30f, 5.0f},
+    {"5) Store-Brand Cola    $1.49",  "Enjoy the fizz!",
+     "Chugged the cola. Caffeine kick!",     EFF_SPEED,  0.50f, 8.0f},
+};
+static const MenuItem menuArbys[INV_SLOTS] = {
+    {"1) Classic Beef n Cheddar  $5.79", "WE HAVE THE MEATS! Enjoy!",
+     "Devoured the Beef n Cheddar!",         EFF_HEAL,   0.06f, 8.0f},
+    {"2) Smokehouse Brisket      $7.29", "Smoked low and slow, just for you!",
+     "Ate the brisket. Powerful recovery!",  EFF_HEAL,   0.15f, 15.0f},
+    {"3) Curly Fries (Large)     $3.49", "Curly fries fresh out the fryer!",
+     "Ate the curly fries. Carb rush!",      EFF_SPEED,  0.40f, 6.0f},
+    {"4) Jamocha Shake           $3.99", "One Jamocha shake!",
+     "Drank the shake. Brain freeze + speed!", EFF_SPEED, 0.60f, 10.0f},
+    {"5) Market Fresh Wrap       $6.49", "Market Fresh — literally!",
+     "Wrap consumed. Balanced boost!",       EFF_HEALSPD,0.04f, 10.0f},
+};
+static const MenuItem menuLJS[INV_SLOTS] = {
+    {"1) Fish & Chips (3pc)   $8.99",  "Arrr, three golden fish pieces!",
+     "Fish & Chips demolished. Sea power!", EFF_HEAL,   0.10f, 10.0f},
+    {"2) Shrimp Basket        $7.49",  "Shrimp basket, fresh from the sea!",
+     "Shrimp inhaled. Speed of a dolphin!", EFF_SPEED,  0.45f, 8.0f},
+    {"3) Hush Puppies (6pc)   $2.79",  "Six hush puppies, aye aye cap'n!",
+     "Hush puppies eaten. Mild recovery.",  EFF_HEAL,   0.03f, 5.0f},
+    {"4) Coleslaw             $1.99",  "Classic coleslaw, nautical style!",
+     "Coleslaw finished. Vitamins!",        EFF_HEAL,   0.02f, 4.0f},
+    {"5) Root Beer Float      $2.49",  "Root beer float, ahoy!",
+     "Float consumed. Maximum caffeine!",   EFF_SPEED,  0.70f, 12.0f},
+};
+
+static void initStores(){
+    numStores = 0;
+    float halfW = TERRAIN_SIZE * TERRAIN_SCALE * 0.5f;
+    srand(terrainSeed ^ 0xF00DC0DE);
+    for(int ai = 0; ai < numAirports && numStores < MAX_STORES - 3; ai++){
+        float apx = airports[ai].wx, apz = airports[ai].wz;
+        int nStores = 1 + rand() % 3;
+        for(int s = 0; s < nStores && numStores < MAX_STORES; s++){
+            float angle = ((float)rand()/RAND_MAX) * 6.28318f;
+            float dist  = 80.0f + ((float)rand()/RAND_MAX) * 120.0f;
+            float sx = apx + cosf(angle) * dist;
+            float sz = apz + sinf(angle) * dist;
+            sx = clampf(sx, -halfW + 20, halfW - 20);
+            sz = clampf(sz, -halfW + 20, halfW - 20);
+            float sy = terrainHeightAt(sx, sz);
+            int gx2 = (int)((sx/TERRAIN_SCALE) + TERRAIN_SIZE*0.5f);
+            int gz2 = (int)((sz/TERRAIN_SCALE) + TERRAIN_SIZE*0.5f);
+            gx2 = gx2<0?0:(gx2>TERRAIN_SIZE?TERRAIN_SIZE:gx2);
+            gz2 = gz2<0?0:(gz2>TERRAIN_SIZE?TERRAIN_SIZE:gz2);
+            if(terrainBiome[gz2][gx2] == 0) continue;
+            Store *st = &stores[numStores++];
+            st->wx = sx; st->wy = sy; st->wz = sz;
+            st->heading = ((float)rand()/RAND_MAX) * 6.28318f;
+            st->type = (StoreType)(rand() % 3);
+        }
+    }
+    // Flatten terrain under every store so buildings sit on level ground
+    for(int i = 0; i < numStores; i++){
+        Store *st = &stores[i];
+        float elev = terrainHeightAt(st->wx, st->wz);
+        st->wy = elev;
+        flattenRect(st->wx, st->wz, st->heading,
+                    (SD_FRONT + SD_BACK) * 0.5f + 4.0f,
+                    SW_HALF + 4.0f,
+                    elev, 6.0f);
+    }
+    bakeTerrainColors();
+    srand((unsigned)time(NULL));
+}
+
+// Render a 3D sign panel with text above the store entrance.
+// Called inside the store's local coordinate space (after push/translate/rotate).
+// signZ: front face Z of building, signY: top of building, label: sign text.
+// bgR/G/B: sign background, txR/G/B: letter colour.
+static void drawStoreSign(float signZ, float signY, const char *label,
+                          float bgR, float bgG, float bgB,
+                          float txR, float txG, float txB){
+    glDisable(GL_LIGHTING);
+    // Sign backing panel (slightly in front of building face)
+    float sw = 0; // compute pixel width so we can center
+    for(const char *c=label;*c;c++) sw += glutBitmapWidth(GLUT_BITMAP_HELVETICA_18,*c);
+    float worldW = sw * 0.018f; // approx world units per pixel at this scale
+
+    // Background panel
+    glColor3f(bgR, bgG, bgB);
+    glNormal3f(0,0,1);
+    glBegin(GL_QUADS);
+        glVertex3f(-worldW*0.5f - 0.15f, signY + 0.05f, signZ + 0.08f);
+        glVertex3f( worldW*0.5f + 0.15f, signY + 0.05f, signZ + 0.08f);
+        glVertex3f( worldW*0.5f + 0.15f, signY + 0.65f, signZ + 0.08f);
+        glVertex3f(-worldW*0.5f - 0.15f, signY + 0.65f, signZ + 0.08f);
+    glEnd();
+
+    // Text — project sign centre to screen coords, then draw in window space
+    // so glRasterPos clipping can't silently swallow the text.
+    {
+        GLdouble mv[16], proj[16]; GLint vp[4];
+        glGetDoublev(GL_MODELVIEW_MATRIX,  mv);
+        glGetDoublev(GL_PROJECTION_MATRIX, proj);
+        glGetIntegerv(GL_VIEWPORT, vp);
+        GLdouble sx, sy, sz;
+        if(gluProject(0.0, signY+0.36f, signZ+0.10f, mv, proj, vp, &sx, &sy, &sz) == GL_TRUE
+           && sz > 0.0 && sz < 1.0){
+            // compute pixel width of text
+            float pw = 0;
+            for(const char *c=label;*c;c++) pw += glutBitmapWidth(GLUT_BITMAP_HELVETICA_18,*c);
+            // switch to window space
+            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+            glOrtho(0, vp[2], 0, vp[3], -1, 1);
+            glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+            glDisable(GL_DEPTH_TEST);
+            glColor3f(txR, txG, txB);
+            glRasterPos2f((float)(sx - pw*0.5f), (float)sy);
+            for(const char *c=label;*c;c++)
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *c);
+            glEnable(GL_DEPTH_TEST);
+            glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+            glMatrixMode(GL_MODELVIEW);
+        }
+    }
+
+    glEnable(GL_LIGHTING);
+}
+
+static void drawStoreFascia(float w, float h, float d,
+                             float yr, float yg, float yb,
+                             float fr, float fg, float fb){
+    drawBox(0, 0, 0, w, h, d, yr, yg, yb);
+    // Coloured fascia band
+    glDisable(GL_LIGHTING);
+    glColor3f(fr, fg, fb);
+    glNormal3f(0,0,1);
+    glBegin(GL_QUADS);
+        glVertex3f(-w*0.85f, h*0.55f, d+0.02f);
+        glVertex3f( w*0.85f, h*0.55f, d+0.02f);
+        glVertex3f( w*0.85f, h*0.90f, d+0.02f);
+        glVertex3f(-w*0.85f, h*0.90f, d+0.02f);
+    glEnd();
+    glEnable(GL_LIGHTING);
+}
+
+// Draw the interior of a store in store-local coordinates.
+// Layout: door at Z=+SD_FRONT, counter at Z=SCOUNTER_Z, back wall at Z=-SD_BACK.
+// Width: X = -SW_HALF .. +SW_HALF. Height: 0 .. SCEIL.
+static void drawStoreInterior(StoreType type){
+    float W = SW_HALF, D = SD_BACK, F = SD_FRONT, H = SCEIL;
+    float CZ = SCOUNTER_Z; // counter front face
+
+    // Floor — tiled appearance via colour alternation done with single quad
+    glColor3f(0.74f, 0.72f, 0.68f);
+    glNormal3f(0,1,0);
+    glBegin(GL_QUADS);
+        glVertex3f(-W,0,-D); glVertex3f(W,0,-D);
+        glVertex3f(W,0, F);  glVertex3f(-W,0,F);
+    glEnd();
+    // Tile grid lines (darker strips)
+    glColor3f(0.62f,0.60f,0.57f);
+    for(float tz=-D; tz<F; tz+=2.0f){
+        glBegin(GL_QUADS);
+            glVertex3f(-W,0.005f,tz); glVertex3f(W,0.005f,tz);
+            glVertex3f(W,0.005f,tz+0.06f); glVertex3f(-W,0.005f,tz+0.06f);
+        glEnd();
+    }
+    for(float tx=-W; tx<W; tx+=2.0f){
+        glBegin(GL_QUADS);
+            glVertex3f(tx,0.005f,-D); glVertex3f(tx+0.06f,0.005f,-D);
+            glVertex3f(tx+0.06f,0.005f,F); glVertex3f(tx,0.005f,F);
+        glEnd();
+    }
+
+    // Ceiling with fluorescent light panels
+    glColor3f(0.94f,0.94f,0.92f);
+    glNormal3f(0,-1,0);
+    glBegin(GL_QUADS);
+        glVertex3f(-W,H,-D); glVertex3f(-W,H,F);
+        glVertex3f(W,H,F);   glVertex3f(W,H,-D);
+    glEnd();
+    // Light panels (bright white insets)
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glColor4f(1.0f,0.98f,0.90f,0.5f);
+    for(float lz=-D+2.0f; lz<F; lz+=4.0f){
+        glBegin(GL_QUADS);
+            glVertex3f(-W+1.0f,H-0.01f,lz);   glVertex3f(W-1.0f,H-0.01f,lz);
+            glVertex3f(W-1.0f,H-0.01f,lz+1.2f); glVertex3f(-W+1.0f,H-0.01f,lz+1.2f);
+        glEnd();
+    }
+    glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+
+    // Walls
+    glColor3f(0.87f,0.86f,0.84f);
+    // Back wall
+    glNormal3f(0,0,1);
+    glBegin(GL_QUADS);
+        glVertex3f(-W,0,-D); glVertex3f(-W,H,-D);
+        glVertex3f(W,H,-D);  glVertex3f(W,0,-D);
+    glEnd();
+    // Front wall (with door gap)
+    glNormal3f(0,0,-1);
+    glBegin(GL_QUADS); // left of door
+        glVertex3f(-W,0,F); glVertex3f(-W,H,F);
+        glVertex3f(-1.2f,H,F); glVertex3f(-1.2f,0,F);
+    glEnd();
+    glBegin(GL_QUADS); // right of door
+        glVertex3f(1.2f,0,F); glVertex3f(1.2f,H,F);
+        glVertex3f(W,H,F);    glVertex3f(W,0,F);
+    glEnd();
+    glBegin(GL_QUADS); // above door
+        glVertex3f(-1.2f,2.3f,F); glVertex3f(-1.2f,H,F);
+        glVertex3f(1.2f,H,F);     glVertex3f(1.2f,2.3f,F);
+    glEnd();
+    // Side walls
+    for(int side=-1;side<=1;side+=2){
+        float sx = side*W;
+        glColor3f(0.85f,0.84f,0.82f);
+        glNormal3f(-side,0,0);
+        glBegin(GL_QUADS);
+            glVertex3f(sx,0,-D); glVertex3f(sx,H,-D);
+            glVertex3f(sx,H, F); glVertex3f(sx,0, F);
+        glEnd();
+    }
+
+    // Brand colours for counter/header
+    float ctr, ctg, ctb;
+    if(type==STORE_ALBERTSONS){ ctr=0.12f; ctg=0.28f; ctb=0.70f; }
+    else if(type==STORE_ARBYS){ ctr=0.80f; ctg=0.10f; ctb=0.10f; }
+    else                       { ctr=0.22f; ctg=0.40f; ctb=0.72f; }
+
+    // Service counter — spans full width, sits at CZ
+    float ctW = W - 0.5f; // counter half-width
+    drawBox(0, 0, CZ - 0.6f,  ctW, 1.1f, 0.6f,  ctr*0.55f, ctg*0.55f, ctb*0.55f);
+    // Counter top (marble-ish white)
+    glColor3f(0.90f,0.88f,0.84f);
+    glNormal3f(0,1,0);
+    glBegin(GL_QUADS);
+        glVertex3f(-ctW,1.1f,CZ-1.2f); glVertex3f(ctW,1.1f,CZ-1.2f);
+        glVertex3f(ctW,1.1f,CZ+0.05f); glVertex3f(-ctW,1.1f,CZ+0.05f);
+    glEnd();
+    // Cash registers
+    drawBox(-ctW*0.5f, 1.1f, CZ-0.7f,  0.45f, 0.40f, 0.28f,  0.12f,0.12f,0.15f);
+    drawBox( ctW*0.5f, 1.1f, CZ-0.7f,  0.45f, 0.40f, 0.28f,  0.12f,0.12f,0.15f);
+    // Screens on registers
+    glColor3f(0.0f,0.5f,1.0f);
+    glNormal3f(0,0,1);
+    glBegin(GL_QUADS);
+        glVertex3f(-ctW*0.5f-0.3f,1.5f,CZ-0.43f); glVertex3f(-ctW*0.5f+0.3f,1.5f,CZ-0.43f);
+        glVertex3f(-ctW*0.5f+0.3f,1.8f,CZ-0.43f); glVertex3f(-ctW*0.5f-0.3f,1.8f,CZ-0.43f);
+        glVertex3f( ctW*0.5f-0.3f,1.5f,CZ-0.43f); glVertex3f( ctW*0.5f+0.3f,1.5f,CZ-0.43f);
+        glVertex3f( ctW*0.5f+0.3f,1.8f,CZ-0.43f); glVertex3f( ctW*0.5f-0.3f,1.8f,CZ-0.43f);
+    glEnd();
+
+    // Menu board on back wall — big dark panel
+    drawBox(0, 2.2f, -D+0.06f,  W*0.75f, 1.0f, 0.05f,  0.07f,0.07f,0.09f);
+    // Header colour bar
+    glDisable(GL_LIGHTING);
+    glColor3f(ctr, ctg, ctb);
+    glNormal3f(0,0,1);
+    glBegin(GL_QUADS);
+        glVertex3f(-W*0.75f,3.0f,-D+0.12f); glVertex3f(W*0.75f,3.0f,-D+0.12f);
+        glVertex3f(W*0.75f,3.4f,-D+0.12f);  glVertex3f(-W*0.75f,3.4f,-D+0.12f);
+    glEnd();
+    glEnable(GL_LIGHTING);
+
+    // Store-specific fill
+    if(type==STORE_ALBERTSONS){
+        // Three long aisle shelving rows between counter and door
+        float aisle_zs[] = {-8.0f, -4.0f, 0.0f};
+        for(int ai=0;ai<3;ai++){
+            float az = aisle_zs[ai];
+            // Shelf unit (left side, right side)
+            for(int side=-1;side<=1;side+=2){
+                float shx = side * 6.5f;
+                for(int shelf=0;shelf<4;shelf++){
+                    float sy2 = 0.3f + shelf*0.65f;
+                    drawBox(shx, sy2, az,  1.0f, 0.04f, 4.5f,  0.72f,0.70f,0.68f);
+                }
+                // Upright supports
+                drawBox(shx, 0, az-4.5f,  0.08f, 2.9f, 0.08f,  0.60f,0.58f,0.55f);
+                drawBox(shx, 0, az+4.5f,  0.08f, 2.9f, 0.08f,  0.60f,0.58f,0.55f);
+                // Products on each shelf
+                for(int shelf=0;shelf<4;shelf++){
+                    float sy2 = 0.35f + shelf*0.65f;
+                    for(int p=0;p<10;p++){
+                        float pz2 = az - 4.0f + p*0.88f;
+                        float pr2=(p%4==0)?0.85f:(p%4==1)?0.15f:(p%4==2)?0.90f:0.50f;
+                        float pg2=(p%4==0)?0.15f:(p%4==1)?0.65f:(p%4==2)?0.80f:0.30f;
+                        float pb2=(p%4==0)?0.15f:(p%4==1)?0.20f:(p%4==2)?0.10f:0.85f;
+                        drawBox(shx+(side)*0.0f, sy2, pz2,  0.1f, 0.22f, 0.10f,  pr2,pg2,pb2);
+                    }
+                }
+            }
+        }
+        // Checkout lanes near entrance
+        for(int lane=-1;lane<=1;lane+=2){
+            drawBox(lane*3.5f, 0, F-2.5f,  0.8f, 0.9f, 1.2f,  0.55f,0.55f,0.60f);
+        }
+        // Produce section at back-left: green mounds
+        for(int p=0;p<6;p++){
+            float px2=-W+1.8f+(p%3)*1.5f, pz2=-D+1.5f+(p/3)*1.5f;
+            drawBox(px2, 0, pz2,  0.6f, 0.35f, 0.6f,  0.20f+p*0.03f,0.55f,0.15f);
+        }
+
+    } else if(type==STORE_ARBYS){
+        // Booth seating along side walls
+        for(int side=-1;side<=1;side+=2){
+            for(int b=0;b<4;b++){
+                float bz = -D+2.0f + b*3.0f;
+                float bx = side*(W-1.2f);
+                // Seat
+                drawBox(bx, 0, bz,  0.9f, 0.45f, 0.9f,  0.60f,0.15f,0.10f);
+                // Table
+                drawBox(bx, 0.45f, bz,  0.8f, 0.05f, 0.6f,  0.78f,0.68f,0.55f);
+                // Table leg
+                drawBox(bx, 0, bz,  0.06f, 0.45f, 0.06f,  0.45f,0.38f,0.30f);
+                // Backrest
+                drawBox(bx, 0.45f, bz+(side<0?-0.85f:0.85f),  0.9f, 0.55f, 0.06f,  0.55f,0.12f,0.10f);
+            }
+        }
+        // Menu display boards across back wall
+        for(int bd=0;bd<3;bd++){
+            float bx2=-ctW*0.6f+bd*ctW*0.6f;
+            drawBox(bx2, 1.6f, -D+0.08f,  ctW*0.18f, 0.5f, 0.04f,  0.07f,0.07f,0.09f);
+        }
+        // Drive-through pickup window on side wall
+        glColor3f(0.65f,0.78f,0.90f);
+        glNormal3f(-1,0,0);
+        glBegin(GL_QUADS);
+            glVertex3f(-W+0.02f,1.0f,-D+3.0f); glVertex3f(-W+0.02f,2.2f,-D+3.0f);
+            glVertex3f(-W+0.02f,2.2f,-D+5.0f); glVertex3f(-W+0.02f,1.0f,-D+5.0f);
+        glEnd();
+        // Sauce / condiment station mid-floor
+        drawBox(0, 0, -1.0f,  1.5f, 1.0f, 0.5f,  0.72f,0.60f,0.45f);
+        for(int sc=0;sc<5;sc++)
+            drawBox(-1.0f+sc*0.5f, 1.0f, -0.9f,  0.09f, 0.22f, 0.09f,  0.85f,0.12f,0.10f);
+
+    } else { // LJS
+        // Dining tables (round approximated as small squares)
+        for(int t2=0;t2<6;t2++){
+            float tx2=(t2%3-1)*5.5f, tz2=(t2/3)*4.0f-9.0f;
+            drawBox(tx2, 0, tz2,  0.9f, 0.75f, 0.9f,  0.18f,0.35f,0.60f); // table
+            drawBox(tx2, 0.75f, tz2,  0.8f, 0.04f, 0.8f,  0.70f,0.68f,0.65f); // top
+            for(int ch=0;ch<4;ch++){ // chairs
+                float ca=ch*1.5708f;
+                drawBox(tx2+cosf(ca)*1.3f,0,tz2+sinf(ca)*1.3f, 0.35f,0.45f,0.35f, 0.22f,0.38f,0.62f);
+            }
+        }
+        // Fish tank on back wall, full width glow
+        drawBox(0, 0.6f, -D+0.4f,  W-1.0f, 0.8f, 0.3f,  0.03f,0.05f,0.18f);
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glColor4f(0.10f,0.40f,0.90f,0.30f);
+        glBegin(GL_QUADS);
+            glNormal3f(0,0,1);
+            glVertex3f(-(W-1.0f),0.0f,-D+0.72f); glVertex3f(W-1.0f,0.0f,-D+0.72f);
+            glVertex3f(W-1.0f,1.4f,-D+0.72f);    glVertex3f(-(W-1.0f),1.4f,-D+0.72f);
+        glEnd();
+        glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+        // Barrel / crate decor
+        for(int cr=0;cr<3;cr++)
+            drawBox(-W+1.5f+cr*1.2f, 0, F-1.5f,  0.45f,0.80f,0.45f, 0.50f,0.32f,0.15f);
+        // Nautical porthole windows on side wall (dark circles approximated)
+        for(int pw=0;pw<3;pw++){
+            float pz2=-D+2.0f+pw*4.0f;
+            drawBox(W-0.08f, 1.8f, pz2,  0.04f,0.55f,0.55f, 0.55f,0.55f,0.58f);
+        }
+    }
+}
+
+// Render the interior UI (menu board text + ordering instructions) as a 2D overlay.
+static void renderStoreUI(StoreType type){
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    gluOrtho2D(0, resWidth, 0, resHeight);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING);
+
+    const MenuItem *menu;
+    const char *storeName;
+    float hr, hg, hb;
+    if(type==STORE_ALBERTSONS){ menu=menuAlbertsons; storeName="ALBERTSONS";         hr=0.12f;hg=0.28f;hb=0.90f; }
+    else if(type==STORE_ARBYS){ menu=menuArbys;      storeName="ARBY'S";             hr=0.90f;hg=0.10f;hb=0.10f; }
+    else                       { menu=menuLJS;        storeName="LONG JOHN SILVER'S"; hr=0.10f;hg=0.40f;hb=0.90f; }
+
+    int panelW = 340, panelH = 280;
+    int px = resWidth - panelW - 10, py = resHeight/2 - panelH/2;
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.04f,0.04f,0.07f,0.88f);
+    glBegin(GL_QUADS);
+        glVertex2i(px, py);           glVertex2i(px+panelW, py);
+        glVertex2i(px+panelW, py+panelH); glVertex2i(px, py+panelH);
+    glEnd();
+    glColor4f(hr,hg,hb,0.92f);
+    glBegin(GL_QUADS);
+        glVertex2i(px, py+panelH-36); glVertex2i(px+panelW, py+panelH-36);
+        glVertex2i(px+panelW, py+panelH); glVertex2i(px, py+panelH);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1,1,1);
+    glRasterPos2i(px+8, py+panelH-20);
+    for(const char *c=storeName;*c;c++) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18,*c);
+
+    // Menu items with inventory count
+    for(int i=0;i<INV_SLOTS;i++){
+        // Highlight if item is in inventory
+        if(inventory[i] > 0) glColor3f(0.40f,1.0f,0.40f);
+        else                  glColor3f(0.92f,0.88f,0.80f);
+        char line[96];
+        snprintf(line, sizeof(line), "%s  [x%d]", menu[i].label, inventory[i]);
+        glRasterPos2i(px+8, py+panelH-62 - i*36);
+        for(const char *c=line;*c;c++) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12,*c);
+        // Second press hint
+        if(inventory[i] > 0){
+            glColor3f(0.60f,0.90f,0.60f);
+            glRasterPos2i(px+8, py+panelH-76 - i*36);
+            const char *eat = "  ^ press again to consume";
+            for(const char *c=eat;*c;c++) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12,*c);
+        }
+    }
+
+    // Divider
+    glColor3f(0.35f,0.35f,0.45f);
+    glBegin(GL_LINES);
+        glVertex2i(px+4, py+14); glVertex2i(px+panelW-4, py+14);
+    glEnd();
+
+    glColor3f(0.50f,0.80f,0.50f);
+    glRasterPos2i(px+8, py+4);
+    const char *hint = "WASD=walk  1-5=order/eat  F=exit (from door)";
+    for(const char *c=hint;*c;c++) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12,*c);
+
+    glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING);
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+}
+
+static void renderStores(){
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+
+    glEnable(GL_LIGHTING);
+    for(int i = 0; i < numStores; i++){
+        Store *s = &stores[i];
+        float dx = s->wx - eyeX, dz = s->wz - eyeZ;
+        if(dx*dx + dz*dz > 2000.0f*2000.0f) continue;
+
+        glPushMatrix();
+        glTranslatef(s->wx, s->wy, s->wz);
+        glRotatef(s->heading * 57.2958f, 0, 1, 0);
+
+        // Exterior shell — sized to match the interior (SW_HALF wide, SD_BACK+SD_FRONT deep)
+        // Local Z: door at +SD_FRONT, back at -SD_BACK. Centre of building at Z=(SD_FRONT-SD_BACK)/2
+        float bW = SW_HALF;                          // half-width = 10
+        float bD = (SD_FRONT + SD_BACK) * 0.5f;     // half-depth = 9.5
+        float bCZ = (SD_FRONT - SD_BACK) * 0.5f;    // centre offset = -4.5
+        float bH = SCEIL;                            // height = 4
+
+        switch(s->type){
+        case STORE_ALBERTSONS:
+            // Flat-roofed big-box grocery
+            drawStoreFascia(bW, bH, bD + bCZ,         // front face at local Z=SD_FRONT
+                            0.88f,0.88f,0.88f, 0.12f,0.28f,0.70f);
+            drawStoreSign(bD + bCZ, bH, "Albertsons",
+                          0.12f,0.28f,0.70f, 1.0f,1.0f,1.0f);
+            // Side + back walls
+            drawBox(0, 0, bCZ,  bW, bH, bD,  0.86f,0.86f,0.84f);
+            // Canopy over entrance
+            drawBox(0, bH, bD+bCZ+0.3f,  bW*0.6f, 0.22f, 1.5f,  0.12f,0.28f,0.70f);
+            // Parking light poles
+            for(int pl=-1;pl<=1;pl+=2){
+                drawBox(pl*(bW+2.0f), 0, bCZ,  0.12f, 5.5f, 0.12f,  0.65f,0.65f,0.65f);
+                glDisable(GL_LIGHTING);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glColor4f(1.0f,0.95f,0.7f,0.45f);
+                glBegin(GL_TRIANGLE_FAN);
+                    glVertex3f(pl*(bW+2.0f),5.6f,bCZ);
+                    for(int k=0;k<=8;k++){ float a=k*6.28318f/8;
+                        glVertex3f(pl*(bW+2.0f)+cosf(a)*1.5f,5.6f,bCZ+sinf(a)*1.5f); }
+                glEnd();
+                glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+            }
+            // Door frame
+            drawBox(0, 0, bD+bCZ+0.05f,  1.2f, 2.4f, 0.08f,  0.55f,0.62f,0.68f);
+            break;
+
+        case STORE_ARBYS:
+            drawStoreFascia(bW, bH, bD+bCZ,
+                            0.75f,0.55f,0.30f, 0.80f,0.10f,0.10f);
+            drawStoreSign(bD+bCZ, bH, "Arby's",
+                          0.80f,0.10f,0.10f, 1.0f,0.85f,0.05f);
+            drawBox(0, 0, bCZ,  bW, bH, bD,  0.73f,0.53f,0.28f);
+            // Signature peaked hat roof
+            glColor3f(0.80f,0.10f,0.10f);
+            glBegin(GL_TRIANGLE_FAN);
+                glNormal3f(0,1,0.2f);
+                glVertex3f(0, bH+1.8f, bCZ);
+                glVertex3f(-bW, bH, -(bD-bCZ)); glVertex3f(bW, bH, -(bD-bCZ));
+                glVertex3f(bW, bH, bD+bCZ);     glVertex3f(-bW, bH, bD+bCZ);
+                glVertex3f(-bW, bH, -(bD-bCZ));
+            glEnd();
+            // Drive-through lane
+            glColor3f(0.90f,0.80f,0.10f);
+            glNormal3f(0,1,0);
+            glBegin(GL_QUADS);
+                glVertex3f(-1.2f,0.02f,bD+bCZ); glVertex3f(1.2f,0.02f,bD+bCZ);
+                glVertex3f(1.2f,0.02f,bD+bCZ+10.0f); glVertex3f(-1.2f,0.02f,bD+bCZ+10.0f);
+            glEnd();
+            drawBox(0, 0, bD+bCZ+0.05f,  1.0f, 2.2f, 0.08f,  0.60f,0.55f,0.50f);
+            break;
+
+        case STORE_LJS:
+            drawStoreFascia(bW, bH, bD+bCZ,
+                            0.22f,0.40f,0.72f, 1.00f,0.85f,0.10f);
+            drawStoreSign(bD+bCZ, bH, "Long John Silver's",
+                          0.10f,0.20f,0.55f, 1.0f,0.85f,0.10f);
+            drawBox(0, 0, bCZ,  bW, bH, bD,  0.20f,0.38f,0.70f);
+            // White peaked roof
+            glColor3f(0.92f,0.92f,0.92f);
+            glBegin(GL_TRIANGLES);
+                glNormal3f(0, bD, bW);
+                glVertex3f(-bW,bH,-(bD-bCZ)); glVertex3f(bW,bH,-(bD-bCZ));
+                glVertex3f(0, bH+2.2f, bCZ);
+                glNormal3f(0, bD,-bW);
+                glVertex3f(-bW,bH,bD+bCZ); glVertex3f(bW,bH,bD+bCZ);
+                glVertex3f(0, bH+2.2f, bCZ);
+                glNormal3f(-bW, bD, 0);
+                glVertex3f(-bW,bH,-(bD-bCZ)); glVertex3f(-bW,bH,bD+bCZ);
+                glVertex3f(0, bH+2.2f, bCZ);
+                glNormal3f(bW, bD, 0);
+                glVertex3f(bW,bH,-(bD-bCZ)); glVertex3f(bW,bH,bD+bCZ);
+                glVertex3f(0, bH+2.2f, bCZ);
+            glEnd();
+            drawBox(0, 0, bD+bCZ+0.05f,  1.0f, 2.2f, 0.08f,  0.55f,0.62f,0.68f);
+            break;
+        }
+
+        // If player is inside this store, render the interior too
+        if(inStoreIdx == i){
+            drawStoreInterior(s->type);
+        }
+
+        glPopMatrix();
+    }
+}
+
+// Render the store interior UI overlay (called from renderScene after world is drawn)
+static void renderStoreOverlay(){
+    if(inStoreIdx < 0 || inStoreIdx >= numStores) return;
+    renderStoreUI(stores[inStoreIdx].type);
+}
+
 // -------- Trees --------
 static void initTrees(){
     numTrees = 0;
@@ -3997,7 +4815,7 @@ static void initTrees(){
         gx = gx<0?0:(gx>TERRAIN_SIZE?TERRAIN_SIZE:gx);
         gz = gz<0?0:(gz>TERRAIN_SIZE?TERRAIN_SIZE:gz);
         int biome = terrainBiome[gz][gx];
-        if(biome == 0 || biome == 4) continue; // skip water & snow
+        if(biome == 0 || biome == 4 || biome == 7) continue; // skip water, snow, canyon
         if(h > TERRAIN_HEIGHT * 0.65f) continue;
 
         // Skip near airports
@@ -4010,14 +4828,172 @@ static void initTrees(){
 
         Tree *t = &trees[numTrees++];
         t->x = tx; t->z = tz; t->y = h;
-        t->h = 3.5f + (float)rand()/RAND_MAX * 5.0f;
-        t->r = t->h * 0.45f;
-        // Variant by biome: grass/highland=oak(1), sand=palm(2), rock=pine(0)
-        if(biome == 1)       t->variant = 2; // palm for sand
-        else if(biome == 3)  t->variant = 0; // pine for highland/rock
-        else                 t->variant = 1; // oak for grass
+        t->h = 8.0f + (float)rand()/RAND_MAX * 18.0f;  // jurassic scale trees
+        t->r = t->h * 0.55f;
+        // Variant by biome: grass/highland=oak(1), sand/desert=palm(2), rock/tundra=pine(0), wetland=oak
+        if(biome == 1)                  t->variant = 2; // palm for sand/desert
+        else if(biome == 3 || biome==5) t->variant = 0; // pine for rock/tundra
+        else                            t->variant = 1; // oak for grass/wetland
     }
     srand((unsigned)time(NULL));
+}
+
+// -------- Suburbs --------
+#define MAX_SUBURB_HOUSES 1200
+typedef struct {
+    float wx, wy, wz;
+    float heading;
+    float w, d, h;   // half-width, half-depth, wall height
+    float r, g, b;   // wall color
+    float rr, rg, rb; // roof color
+} SuburbHouse;
+static SuburbHouse suburbHouses[MAX_SUBURB_HOUSES];
+static int numSuburbHouses = 0;
+
+static void initSuburbs(){
+    numSuburbHouses = 0;
+    srand(terrainSeed ^ 0xCAFEBABE);
+    float halfW = TERRAIN_SIZE * TERRAIN_SCALE * 0.5f;
+
+    static const float wallPalette[][3] = {
+        {0.93f,0.87f,0.78f},{0.80f,0.72f,0.60f},{0.75f,0.80f,0.70f},
+        {0.90f,0.78f,0.70f},{0.72f,0.78f,0.85f},{0.85f,0.82f,0.75f},
+    };
+    static const float roofPalette[][3] = {
+        {0.35f,0.20f,0.12f},{0.50f,0.25f,0.18f},{0.28f,0.28f,0.32f},
+        {0.60f,0.42f,0.28f},{0.20f,0.30f,0.22f},{0.45f,0.35f,0.28f},
+    };
+
+    for(int ai = 0; ai < numAirports && numSuburbHouses < MAX_SUBURB_HOUSES - 60; ai++){
+        float apx = airports[ai].wx, apz = airports[ai].wz;
+        int nBlocks = 3 + rand() % 4;
+        for(int bl = 0; bl < nBlocks; bl++){
+            float angle = ((float)rand()/RAND_MAX) * 6.28318f;
+            float dist  = 160.0f + ((float)rand()/RAND_MAX) * 220.0f;
+            float bx = apx + cosf(angle)*dist;
+            float bz = apz + sinf(angle)*dist;
+            bx = clampf(bx, -halfW+30, halfW-30);
+            bz = clampf(bz, -halfW+30, halfW-30);
+            int gx = (int)((bx/TERRAIN_SCALE) + TERRAIN_SIZE*0.5f);
+            int gz = (int)((bz/TERRAIN_SCALE) + TERRAIN_SIZE*0.5f);
+            gx = gx<0?0:(gx>TERRAIN_SIZE?TERRAIN_SIZE:gx);
+            gz = gz<0?0:(gz>TERRAIN_SIZE?TERRAIN_SIZE:gz);
+            if(terrainBiome[gz][gx] == 0) continue; // skip water
+
+            float blockHead = ((float)rand()/RAND_MAX) * 6.28318f;
+            float ch = cosf(blockHead), sh = sinf(blockHead);
+            int rows = 2 + rand() % 3, cols = 3 + rand() % 5;
+            float lotW = 10.0f + ((float)rand()/RAND_MAX)*5.0f;
+            float lotD = 12.0f + ((float)rand()/RAND_MAX)*6.0f;
+
+            for(int row = 0; row < rows && numSuburbHouses < MAX_SUBURB_HOUSES; row++){
+                for(int col = 0; col < cols && numSuburbHouses < MAX_SUBURB_HOUSES; col++){
+                    float fx = (col - cols*0.5f) * lotW;
+                    float fz = (row - rows*0.5f) * lotD;
+                    float wx = bx + ch*fx + sh*fz;
+                    float wz = bz - sh*fx + ch*fz;
+                    wx = clampf(wx, -halfW+10, halfW-10);
+                    wz = clampf(wz, -halfW+10, halfW-10);
+                    int gx2 = (int)((wx/TERRAIN_SCALE)+TERRAIN_SIZE*0.5f);
+                    int gz2 = (int)((wz/TERRAIN_SCALE)+TERRAIN_SIZE*0.5f);
+                    gx2=gx2<0?0:(gx2>TERRAIN_SIZE?TERRAIN_SIZE:gx2);
+                    gz2=gz2<0?0:(gz2>TERRAIN_SIZE?TERRAIN_SIZE:gz2);
+                    if(terrainBiome[gz2][gx2] == 0) continue;
+                    float ey = terrainHeightAt(wx, wz);
+                    float hw = 2.5f + ((float)rand()/RAND_MAX)*1.5f;
+                    float hd = 3.5f + ((float)rand()/RAND_MAX)*1.5f;
+                    float hh = 2.2f + ((float)rand()/RAND_MAX)*0.8f;
+                    int wi = rand() % 6, ri = rand() % 6;
+                    float hHead = blockHead + (rand()%2)*3.14159f;
+                    flattenRect(wx, wz, hHead, hd+3.0f, hw+3.0f, ey, 4.0f);
+                    SuburbHouse *house = &suburbHouses[numSuburbHouses++];
+                    house->wx = wx; house->wy = ey; house->wz = wz;
+                    house->heading = hHead;
+                    house->w = hw; house->d = hd; house->h = hh;
+                    house->r  = wallPalette[wi][0]; house->g  = wallPalette[wi][1]; house->b  = wallPalette[wi][2];
+                    house->rr = roofPalette[ri][0]; house->rg = roofPalette[ri][1]; house->rb = roofPalette[ri][2];
+                }
+            }
+        }
+    }
+    bakeTerrainColors();
+    srand((unsigned)time(NULL));
+}
+
+static void drawHouse(const SuburbHouse *h){
+    glPushMatrix();
+    glTranslatef(h->wx, h->wy, h->wz);
+    glRotatef(h->heading * 57.2958f, 0, 1, 0);
+
+    // Walls
+    drawBox(0, 0, 0, h->w, h->h, h->d, h->r, h->g, h->b);
+
+    // Pitched roof (two triangular end caps + two sloped faces)
+    float rH = h->w * 0.65f; // peak height above walls
+    glDisable(GL_LIGHTING);
+    glColor3f(h->rr, h->rg, h->rb);
+    glNormal3f(0, h->d, rH);
+    glBegin(GL_QUADS);
+        glVertex3f(-h->w, h->h,  h->d);
+        glVertex3f( h->w, h->h,  h->d);
+        glVertex3f( h->w, h->h, -h->d);
+        glVertex3f(-h->w, h->h, -h->d);
+    glEnd();
+    // Front slope
+    glNormal3f(0, rH, h->d);
+    glBegin(GL_TRIANGLES);
+        glVertex3f(-h->w, h->h,  h->d);
+        glVertex3f( h->w, h->h,  h->d);
+        glVertex3f(0,     h->h + rH, 0);
+    glEnd();
+    // Back slope
+    glNormal3f(0, rH, -h->d);
+    glBegin(GL_TRIANGLES);
+        glVertex3f(-h->w, h->h, -h->d);
+        glVertex3f( h->w, h->h, -h->d);
+        glVertex3f(0,     h->h + rH, 0);
+    glEnd();
+    // Left end cap
+    glNormal3f(-1, 0, 0);
+    glBegin(GL_TRIANGLES);
+        glVertex3f(-h->w, h->h, -h->d);
+        glVertex3f(-h->w, h->h,  h->d);
+        glVertex3f(-h->w, h->h + rH, 0);
+    glEnd();
+    // Right end cap
+    glNormal3f(1, 0, 0);
+    glBegin(GL_TRIANGLES);
+        glVertex3f(h->w, h->h, -h->d);
+        glVertex3f(h->w, h->h,  h->d);
+        glVertex3f(h->w, h->h + rH, 0);
+    glEnd();
+    glEnable(GL_LIGHTING);
+
+    // Driveway (flat dark strip in front)
+    glDisable(GL_LIGHTING);
+    glColor3f(0.30f, 0.30f, 0.30f);
+    glNormal3f(0, 1, 0);
+    glBegin(GL_QUADS);
+        glVertex3f(-h->w*0.4f, 0.03f,  h->d);
+        glVertex3f( h->w*0.4f, 0.03f,  h->d);
+        glVertex3f( h->w*0.4f, 0.03f,  h->d + 5.0f);
+        glVertex3f(-h->w*0.4f, 0.03f,  h->d + 5.0f);
+    glEnd();
+    glEnable(GL_LIGHTING);
+
+    glPopMatrix();
+}
+
+static void renderSuburbs(){
+    if(numSuburbHouses == 0) return;
+    float eyeX = inPlane ? player.x : walkerX;
+    float eyeZ = inPlane ? player.z : walkerZ;
+    for(int i = 0; i < numSuburbHouses; i++){
+        const SuburbHouse *h = &suburbHouses[i];
+        float dx = h->wx - eyeX, dz = h->wz - eyeZ;
+        if(dx*dx + dz*dz > 2000.0f*2000.0f) continue;
+        drawHouse(h);
+    }
 }
 
 static void renderTrees(){
@@ -4038,10 +5014,10 @@ static void renderTrees(){
         Tree *t = &trees[i];
         float dx = t->x - eyeX, dz = t->z - eyeZ;
         float d2 = dx*dx + dz*dz;
-        if(d2 > 500.0f*500.0f) continue;
+        if(d2 > 1400.0f*1400.0f) continue;
 
         float fade = 1.0f;
-        if(d2 > 400.0f*400.0f) fade = 1.0f - (sqrtf(d2)-400.0f)/100.0f;
+        if(d2 > 1200.0f*1200.0f) fade = 1.0f - (sqrtf(d2)-1200.0f)/200.0f;
 
         // Trunk
         glColor3f(0.38f, 0.25f, 0.14f);
@@ -4147,22 +5123,44 @@ static void initClouds(){
 static void renderClouds(){
     if(numClouds == 0) return;
 
-    // Get camera right/up vectors from modelview matrix for billboarding
     float mv[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, mv);
-    float rx = mv[0], ry = mv[4], rz = mv[8];  // right vector (column 0)
-    float ux = mv[1], uy = mv[5], uz = mv[9];  // up vector (column 1)
+    float rx = mv[0], ry = mv[4], rz = mv[8];
+    float ux = mv[1], uy = mv[5], uz = mv[9];
 
     float camX = inPlane ? player.x : walkerX;
     float camY = inPlane ? player.y : walkerY;
     float camZ = inPlane ? player.z : walkerZ;
 
+    // Build visible list with squared distances for back-to-front sort
+    static int  order[MAX_CLOUDS];
+    static float dist2[MAX_CLOUDS];
+    int visible = 0;
+    float cullR = 1200.0f;
+    for(int i = 0; i < numClouds; i++){
+        Cloud *c = &clouds[i];
+        float dx=c->x-camX, dy=c->y-camY, dz=c->z-camZ;
+        float d2 = dx*dx+dy*dy+dz*dz;
+        if(d2 > cullR*cullR) continue;
+        order[visible]  = i;
+        dist2[visible]  = d2;
+        visible++;
+    }
+    // Insertion sort (small N, fast enough)
+    for(int i=1;i<visible;i++){
+        int   ki=order[i]; float kd=dist2[i]; int j=i-1;
+        while(j>=0 && dist2[j]<kd){ order[j+1]=order[j]; dist2[j+1]=dist2[j]; j--; }
+        order[j+1]=ki; dist2[j+1]=kd;
+    }
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_LIGHTING);
-    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_TEXTURE_2D);
+    // Depth test ON, depth write OFF — clouds occlude nothing but are occluded by solid geo
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
 
-    // Each cloud = cluster of 5 spherical billboard quads
     static const float offsets[5][3] = {
         { 0.0f,  0.0f, 0.0f},
         { 0.7f,  0.3f, 0.0f},
@@ -4171,47 +5169,47 @@ static void renderClouds(){
         {-0.3f, -0.4f, 0.0f},
     };
 
-    for(int i = 0; i < numClouds; i++){
-        Cloud *c = &clouds[i];
-        // Cull distant clouds
-        float dx = c->x - camX, dy = c->y - camY, dz = c->z - camZ;
-        if(dx*dx + dy*dy + dz*dz > 900.0f*900.0f) continue;
+    for(int vi = 0; vi < visible; vi++){
+        Cloud *c = &clouds[order[vi]];
+        float dx=c->x-camX, dy=c->y-camY, dz=c->z-camZ;
+        float d2=dist2[vi];
 
-        // Fade alpha by distance & weather
-        float dist2 = dx*dx + dz*dz;
-        float alpha = 0.55f * (1.0f - dist2/(900.0f*900.0f));
-        // More opaque in overcast
-        if(weather.type == WX_OVERCAST || weather.type == WX_STORM)
-            alpha = fminf(alpha * 1.6f, 0.82f);
+        float alpha = 0.58f * (1.0f - d2/(cullR*cullR));
+        if(weather.type==WX_OVERCAST||weather.type==WX_STORM)
+            alpha = fminf(alpha*1.6f, 0.85f);
 
         float b = c->brightness;
-        // Darken under storm
-        if(weather.type == WX_STORM) b *= 0.55f;
-        else if(weather.type == WX_OVERCAST) b *= 0.72f;
+        if(weather.type==WX_STORM) b*=0.50f;
+        else if(weather.type==WX_OVERCAST) b*=0.70f;
+
+        // If camera is inside this cloud, full white fog-like fill
+        float insideR = c->r * 0.6f;
+        if(dx*dx+dy*dy+dz*dz < insideR*insideR){
+            // Already inside — don't draw this cloud (fog covers it)
+            continue;
+        }
+
         glColor4f(b, b, b*0.97f, alpha);
 
         for(int p = 0; p < 5; p++){
-            float px = c->x + offsets[p][0] * c->r * 0.9f;
-            float py = c->y + offsets[p][1] * c->r * 0.5f;
-            float pz = c->z + offsets[p][2] * c->r * 0.9f;
-            float pr = c->r * (0.7f + offsets[p][1] * 0.25f);
-
-            // Billboard quad
+            float px = c->x + offsets[p][0]*c->r*0.9f;
+            float py = c->y + offsets[p][1]*c->r*0.5f;
+            float pz = c->z + offsets[p][2]*c->r*0.9f;
+            float pr = c->r * (0.7f + offsets[p][1]*0.25f);
             glBegin(GL_TRIANGLE_FAN);
             glVertex3f(px, py, pz);
-            for(int j = 0; j <= 8; j++){
-                float a = j * 3.14159f * 2.0f / 8.0f;
-                float ca = cosf(a) * pr, sa = sinf(a) * pr;
-                glVertex3f(px + rx*ca + ux*sa,
-                           py + ry*ca + uy*sa,
-                           pz + rz*ca + uz*sa);
+            for(int j=0;j<=8;j++){
+                float a=j*6.28318f/8.0f;
+                float ca=cosf(a)*pr, sa=sinf(a)*pr;
+                glVertex3f(px+rx*ca+ux*sa, py+ry*ca+uy*sa, pz+rz*ca+uz*sa);
             }
             glEnd();
         }
     }
 
-    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
     glEnable(GL_LIGHTING);
+    glEnable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
 }
 
@@ -4719,7 +5717,26 @@ void renderScene(){
     // Camera
     float camX, camY, camZ, lookX, lookY, lookZ;
     float upX=0, upY=1, upZ=0;
-    if(!inPlane){
+    if(inStoreIdx >= 0 && inStoreIdx < numStores && !inPlane){
+        // Interior camera: follow storeWalkerX/Z in store local space
+        Store *cs = &stores[inStoreIdx];
+        float ch2 = cosf(cs->heading), sh2 = sinf(cs->heading);
+        // Transform local (lx,lz) to world: wx + sh2*lx + ch2*lz, wz + ch2*lx - sh2*lz
+        // Wait — standard rotation: world_x = wx + cos(h)*lx + sin(h)*lz ... let me use apLocalToWorld convention
+        // apLocalToWorld: wx + cos(h)*fwd + sin(h)*side, wz - sin(h)*fwd + cos(h)*side
+        // Here fwd=storeWalkerX maps to X-axis, side=storeWalkerZ maps to Z-axis — use directly:
+        float lx = storeWalkerX, lz = storeWalkerZ;
+        float sws = sinf(storeWalkerYaw), cws = cosf(storeWalkerYaw);
+        camX  = cs->wx + ch2*lx + sh2*lz;
+        camY  = cs->wy + WALKER_EYE_H;
+        camZ  = cs->wz - sh2*lx + ch2*lz;
+        // Look direction is storeWalkerYaw rotated by store heading
+        float lwx = sws, lwz = cws; // local look forward
+        lookX = camX + (ch2*lwx + sh2*lwz);
+        lookY = camY;
+        lookZ = camZ + (-sh2*lwx + ch2*lwz);
+        cockpitView = false;
+    } else if(!inPlane){
         cockpitView = false;
         float sw = sinf(walkerYaw), cw = cosf(walkerYaw);
         camX = walkerX; camY = walkerY + WALKER_EYE_H; camZ = walkerZ;
@@ -4795,8 +5812,11 @@ void renderScene(){
     pthread_mutex_unlock(&remoteMutex);
 
     renderTrees();
+    renderSuburbs();
+    renderStores();
     renderExplosions();
     renderClouds();
+    renderStoreOverlay();
 
     // Cockpit overlay (drawn after world, before HUD)
     if(cockpitView && inPlane && !isPassenger)
@@ -4832,10 +5852,66 @@ void renderScene(){
             sqrtf(weather.windX*weather.windX + weather.windZ*weather.windZ)*10.0f);
     HUD(10, resHeight-54, buf);
 
+    // Health bar (bottom-left, always visible)
+    {
+        int hbx=10, hby=8, hbw=120, hbh=10;
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.15f,0.15f,0.15f,0.7f);
+        glBegin(GL_QUADS);
+            glVertex2i(hbx,hby); glVertex2i(hbx+hbw,hby);
+            glVertex2i(hbx+hbw,hby+hbh); glVertex2i(hbx,hby+hbh);
+        glEnd();
+        float hf = playerHealth;
+        float hr2 = hf<0.5f ? 1.0f : 2.0f*(1-hf);
+        float hg2 = hf>0.5f ? 1.0f : 2.0f*hf;
+        glColor4f(hr2, hg2, 0.0f, 0.9f);
+        glBegin(GL_QUADS);
+            glVertex2i(hbx,hby); glVertex2i(hbx+(int)(hbw*hf),hby);
+            glVertex2i(hbx+(int)(hbw*hf),hby+hbh); glVertex2i(hbx,hby+hbh);
+        glEnd();
+        glDisable(GL_BLEND); glEnable(GL_LIGHTING);
+        glColor3f(0.8f,0.8f,0.8f);
+        HUD12(hbx, hby+hbh+2, "HP");
+        // Active effect indicators
+        int ex = hbx + hbw + 8;
+        if(effectHealTimer > 0){
+            glColor3f(0.3f,1.0f,0.3f);
+            snprintf(buf,sizeof(buf),"HEAL %.0fs", effectHealTimer);
+            HUD12(ex, hby+hbh+2, buf); ex += 70;
+        }
+        if(effectSpeedTimer > 0){
+            glColor3f(1.0f,0.85f,0.1f);
+            snprintf(buf,sizeof(buf),"SPD %.0fs", effectSpeedTimer);
+            HUD12(ex, hby+hbh+2, buf);
+        }
+        // Inventory summary
+        bool hasItems = false;
+        for(int iv=0;iv<INV_SLOTS;iv++) if(inventory[iv]>0){ hasItems=true; break; }
+        if(hasItems){
+            glColor3f(0.7f,0.9f,0.7f);
+            char ibuf[64]="BAG:";
+            for(int iv=0;iv<INV_SLOTS;iv++)
+                if(inventory[iv]>0){ char tmp[8]; snprintf(tmp,sizeof(tmp)," %d×%d",iv+1,inventory[iv]); strcat(ibuf,tmp); }
+            HUD12(hbx, hby-14, ibuf);
+        }
+    }
+
     // Gear warning: airborne, gear up, low altitude
     if(inPlane && !onGround && !gearDeployed && aglHud < 40.0f){
         glColor3f(1,0.1f,0.1f);
         HUD(resWidth/2-80, resHeight/2-60, "GEAR NOT DOWN");
+    }
+
+    // Server hosting info — top right corner
+    if(isServer && !clientConnected){
+        glColor3f(0.4f,0.85f,1.0f);
+        sprintf(buf, "Hosting on %s:5000  |  Share this IP", localIP);
+        int sw=0; for(const char *c=buf;*c;c++) sw+=glutBitmapWidth(GLUT_BITMAP_HELVETICA_12,*c);
+        HUD12(resWidth-sw-8, resHeight-18, buf);
+    } else if(isServer && clientConnected){
+        glColor3f(0.3f,1.0f,0.4f);
+        HUD12(resWidth-120, resHeight-18, "Player connected");
     }
 
     // On-foot / enter-exit prompts
@@ -4843,11 +5919,24 @@ void renderScene(){
         float dx = walkerX-player.x, dz = walkerZ-player.z;
         float distToPlane = sqrtf(dx*dx+dz*dz);
         glColor3f(0.6f,1.0f,0.6f);
-        if(distToPlane <= ENTER_DIST)
-            HUD(resWidth/2-80, resHeight/2-40, "[F] Enter aircraft");
-        else {
-            sprintf(buf, "On foot  |  plane %.0f m away", distToPlane);
-            HUD(10, resHeight-78, buf);
+        // Check proximity to stores
+        bool nearStore = false;
+        for(int si=0;si<numStores;si++){
+            float sdx=walkerX-stores[si].wx, sdz=walkerZ-stores[si].wz;
+            if(sqrtf(sdx*sdx+sdz*sdz) <= STORE_ENTER_DIST+4.0f){
+                const char *snames[]={"Albertsons","Arby's","Long John Silver's"};
+                snprintf(buf, sizeof(buf), "[F] Enter %s", snames[stores[si].type]);
+                HUD(resWidth/2-90, resHeight/2-40, buf);
+                nearStore = true; break;
+            }
+        }
+        if(!nearStore){
+            if(distToPlane <= ENTER_DIST)
+                HUD(resWidth/2-80, resHeight/2-40, "[F] Enter aircraft");
+            else {
+                sprintf(buf, "On foot  |  plane %.0f m away", distToPlane);
+                HUD(10, resHeight-78, buf);
+            }
         }
     } else if(onGround && airspeed < 0.5f){
         glColor3f(0.7f,0.9f,1.0f);
@@ -5045,7 +6134,7 @@ void renderScene(){
     renderRain();
     renderFPS();
 
-    // ---- Chat overlay ----
+    // ---- Chat overlay — own 2D ortho block ----
     // Decay timers
     for(int i=0;i<chatCount;){
         chatLog[i].timer -= DT;
@@ -5054,29 +6143,67 @@ void renderScene(){
             chatCount--;
         } else i++;
     }
-    // Draw up to 6 recent messages bottom-left
     {
-        float cx = 12.0f, cy = 90.0f;
-        int show = chatCount > 6 ? 6 : chatCount;
+        // Enter 2D
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        gluOrtho2D(0, resWidth, 0, resHeight);
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        float cx = 12.0f;
+        // Input box at bottom, messages stacked above it
+        float inputY  = 14.0f;   // bottom of input box
+        float inputH  = 22.0f;
+        float msgBase = chatOpen ? (inputY + inputH + 4.0f) : 14.0f;
+        int   show    = chatCount > 8 ? 8 : chatCount;
+
+        // Draw messages
         for(int i = 0; i < show; i++){
             ChatMsg *m = &chatLog[chatCount - show + i];
-            float alpha = chatOpen ? 0.85f : fminf(m->timer, 1.5f) / 1.5f * 0.85f;
-            glColor4f(0.9f, 0.95f, 1.0f, alpha);
-            glRasterPos2f(cx, cy + i * 16.0f);
+            float alpha = chatOpen ? 0.92f : fminf(m->timer / 1.5f, 1.0f) * 0.88f;
+            if(alpha <= 0.01f) continue;
+            float my = msgBase + i * 18.0f;
+            // Text shadow
+            glColor4f(0,0,0,alpha*0.6f);
+            glRasterPos2f(cx+1, my-1);
+            for(const char *c = m->text; *c; c++)
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
+            // Text
+            glColor4f(0.92f, 0.96f, 1.0f, alpha);
+            glRasterPos2f(cx, my);
             for(const char *c = m->text; *c; c++)
                 glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
         }
-        // Input box when open
+
+        // Input box
         if(chatOpen){
-            menuRect(cx - 2, 60, 320, 20, 0.05f, 0.08f, 0.15f, 0.85f);
-            menuRectOutline(cx - 2, 60, 320, 20, 0.3f, 0.6f, 1.0f);
+            // Background
+            menuRect(cx-2, inputY, 340, inputH, 0.04f,0.07f,0.14f, 0.88f);
+            menuRectOutline(cx-2, inputY, 340, inputH, 0.3f,0.6f,1.0f);
+            // Prompt + typed text + cursor
+            char inputDisplay[CHAT_MSG_LEN+6];
+            snprintf(inputDisplay, sizeof(inputDisplay), "> %s|", chatInput);
             glColor4f(1,1,1,1);
-            glRasterPos2f(cx + 2, 73);
-            char inputDisplay[CHAT_MSG_LEN+4];
-            snprintf(inputDisplay, sizeof(inputDisplay), "> %s_", chatInput);
+            glRasterPos2f(cx+4, inputY+7);
             for(const char *c = inputDisplay; *c; c++)
                 glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
+            // Hint
+            glColor4f(0.5f,0.7f,1.0f,0.6f);
+            glRasterPos2f(cx+4, inputY+inputH+2);
+            const char *hint = "Enter=send  Esc=cancel";
+            for(const char *c = hint; *c; c++)
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
         }
+
+        // Exit 2D
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_LIGHTING);
+        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
     }
     // Swap is handled by the caller so menus can overlay before presenting
 }
@@ -5290,8 +6417,9 @@ static void updateNpcs(float dt){
             n->stateTimer -= dt;
             if(d < 3.0f || n->stateTimer<=0.0f){
                 if(d < 3.0f){
-                    // Board the plane
+                    // Board the plane — start respawn countdown
                     parkedPlanes[p].active = false;
+                    parkedPlanes[p].respawnTimer = PLANE_RESPAWN_TIME;
                     n->ptype    = parkedPlanes[p].type;
                     n->px       = parkedPlanes[p].wx;
                     n->py       = parkedPlanes[p].wy;
@@ -5423,11 +6551,15 @@ static void updateNpcs(float dt){
             n->pz += cosf(n->pyaw)*n->pspeed*dt;
             n->stateTimer -= dt;
             if(n->pspeed<=0.0f || n->stateTimer<=0.0f){
-                // Repark the plane
-                if(numParked<MAX_PARKED){
-                    ParkedPlane *pp=&parkedPlanes[numParked++];
+                // Repark: reuse an inactive slot if available, else append
+                int slot=-1;
+                for(int p=0;p<numParked;p++) if(!parkedPlanes[p].active){ slot=p; break; }
+                if(slot<0 && numParked<MAX_PARKED) slot=numParked++;
+                if(slot>=0){
+                    ParkedPlane *pp=&parkedPlanes[slot];
                     pp->wx=n->px; pp->wy=n->py; pp->wz=n->pz;
                     pp->heading=n->pyaw; pp->active=true; pp->type=n->ptype;
+                    pp->respawnTimer=0.0f;
                 }
                 // Deplane: walker pops out next to plane
                 n->x = n->px + cosf(n->pyaw)*2.0f;
@@ -5474,6 +6606,18 @@ static void updateNpcs(float dt){
 
         } // switch
     } // for npcs
+
+    // Plane respawn: inactive slots count down and re-activate with a fresh plane
+    for(int p=0;p<numParked;p++){
+        if(parkedPlanes[p].active) continue;
+        parkedPlanes[p].respawnTimer -= dt;
+        if(parkedPlanes[p].respawnTimer <= 0.0f){
+            parkedPlanes[p].active = true;
+            // Randomise the plane type on respawn
+            parkedPlanes[p].type = (PlaneType)(rand()%3);
+            parkedPlanes[p].respawnTimer = PLANE_RESPAWN_TIME;
+        }
+    }
 }
 
 static void renderNpcs(){
@@ -5511,26 +6655,100 @@ void updatePhysics(float dt){
 
     if(!inPlane){
         // ---- On-foot walker ----
-        if(keys[XK_a]) walkerYaw += 1.5f*dt;
-        if(keys[XK_d]) walkerYaw -= 1.5f*dt;
+
+        // If inside a store, walk around inside with collision
+        if(inStoreIdx >= 0){
+            float sws = sinf(storeWalkerYaw), cws = cosf(storeWalkerYaw);
+            float mx = 0, mz = 0;
+            float spd = WALKER_SPEED * (1.0f + effectSpeed);
+            // W/S = forward/back, A/D = strafe left/right (mouse turns)
+            if(keys[XK_w]){ mx += sws*spd*dt; mz += cws*spd*dt; }
+            if(keys[XK_s]){ mx -= sws*spd*dt; mz -= cws*spd*dt; }
+            if(keys[XK_a]){ mx -= cws*spd*dt; mz += sws*spd*dt; }
+            if(keys[XK_d]){ mx += cws*spd*dt; mz -= sws*spd*dt; }
+            float nx = storeWalkerX + mx;
+            float nz = storeWalkerZ + mz;
+            // Wall collision (store local bounds)
+            float xLimit = SW_HALF - SWALL_THICK;
+            float zFront = SDOOR_Z - SWALL_THICK;
+            float zBack  = -(SD_BACK - SWALL_THICK);
+            nx = clampf(nx, -xLimit, xLimit);
+            nz = clampf(nz, zBack,   zFront);
+            storeWalkerX = nx; storeWalkerZ = nz;
+
+            // F to exit
+            if(keys[XK_f]){
+                if(!enterKeyHeld){
+                    enterKeyHeld = true;
+                    // Only allow exit when near the door
+                    if(storeWalkerZ > SDOOR_Z - 2.5f){
+                        inStoreIdx = -1;
+                        chatAddMsg("[Store] Thanks for visiting! (press 1-5 anywhere to use items)");
+                    } else {
+                        chatAddMsg("[Store] Walk back to the entrance to leave.");
+                    }
+                }
+            } else enterKeyHeld = false;
+
+            // Decay effects inside store too
+            if(effectHealTimer > 0){ effectHealTimer -= dt;
+                playerHealth = clampf(playerHealth + effectHeal*dt, 0, 1); }
+            if(effectSpeedTimer > 0){ effectSpeedTimer -= dt; }
+            if(effectSpeedTimer <= 0) effectSpeed = 0;
+            if(effectHealTimer  <= 0) effectHeal  = 0;
+
+            pthread_mutex_unlock(&playerMutex);
+            return;
+        }
+
         float moveX = 0, moveZ = 0;
         float swY = sinf(walkerYaw), cwY = cosf(walkerYaw);
+        // W/S = forward/back, A/D = strafe left/right
         if(keys[XK_w]){ moveX += swY*WALKER_SPEED*dt; moveZ += cwY*WALKER_SPEED*dt; }
         if(keys[XK_s]){ moveX -= swY*WALKER_SPEED*dt; moveZ -= cwY*WALKER_SPEED*dt; }
+        if(keys[XK_a]){ moveX -= cwY*WALKER_SPEED*dt; moveZ += swY*WALKER_SPEED*dt; }
+        if(keys[XK_d]){ moveX += cwY*WALKER_SPEED*dt; moveZ -= swY*WALKER_SPEED*dt; }
         walkerX += moveX;
         walkerZ += moveZ;
         walkerY  = terrainHeightAt(walkerX, walkerZ) + 1.0f;
 
-        // F key: enter own plane, a parked plane, or board a remote airliner as passenger
+        // F key: enter store, own plane, parked plane, or remote airliner
         if(keys[XK_f]){
             if(!enterKeyHeld){
                 enterKeyHeld = true;
-                float dx = walkerX - player.x, dz = walkerZ - player.z;
-                if(sqrtf(dx*dx+dz*dz) <= ENTER_DIST){
-                    isPassenger = false;
-                    inPlane = true;
-                } else {
-                    // Board remote airliner as passenger
+                bool acted = false;
+
+                // Check stores first
+                for(int si=0;si<numStores && !acted;si++){
+                    float sdx = walkerX - stores[si].wx;
+                    float sdz = walkerZ - stores[si].wz;
+                    if(sqrtf(sdx*sdx+sdz*sdz) <= STORE_ENTER_DIST){
+                        inStoreIdx       = si;
+                        lastStoreType    = stores[si].type;
+                        storeWalkerX     = 0.0f;
+                        storeWalkerZ     = -(SD_BACK * 0.5f); // spawn in back half of store
+                        storeWalkerYaw   = 0.0f; // face toward door (+Z direction)
+                        // enterKeyHeld stays true — player must release F before exit logic fires
+                        // Clear inventory on store change so items don't mix between stores
+                        for(int iv=0;iv<INV_SLOTS;iv++) inventory[iv]=0;
+                        const char *names[] = {"Albertsons","Arby's","Long John Silver's"};
+                        char msg[96];
+                        snprintf(msg, sizeof(msg), "[Store] Welcome to %s! Walk around, press 1-5 to order.",
+                                 names[stores[si].type]);
+                        chatAddMsg(msg);
+                        acted = true;
+                    }
+                }
+
+                if(!acted){
+                    float dx = walkerX - player.x, dz = walkerZ - player.z;
+                    if(sqrtf(dx*dx+dz*dz) <= ENTER_DIST){
+                        isPassenger = false;
+                        inPlane = true;
+                        acted = true;
+                    }
+                }
+                if(!acted){
                     bool boarded = false;
                     pthread_mutex_lock(&remoteMutex);
                     for(int i=0;i<MAX_PLAYERS-1;i++){
@@ -5544,7 +6762,6 @@ void updatePhysics(float dt){
                     }
                     pthread_mutex_unlock(&remoteMutex);
                     if(!boarded){
-                        // Enter any parked plane
                         for(int i=0;i<numParked;i++){
                             if(!parkedPlanes[i].active) continue;
                             float pdx = walkerX - parkedPlanes[i].wx;
@@ -5559,6 +6776,7 @@ void updatePhysics(float dt){
                                 airspeed = 0.0f; onGround = true;
                                 isPassenger = false;
                                 parkedPlanes[i].active = false;
+                                parkedPlanes[i].respawnTimer = PLANE_RESPAWN_TIME;
                                 inPlane = true;
                                 break;
                             }
@@ -5764,6 +6982,17 @@ void updatePhysics(float dt){
                 gearDeployed = true;
             }
         }
+    }
+
+    // Consumable effect decay (runs regardless of in-plane/on-foot/in-store)
+    if(effectHealTimer > 0){
+        effectHealTimer -= dt;
+        playerHealth = clampf(playerHealth + effectHeal * dt, 0.0f, 1.0f);
+        if(effectHealTimer <= 0){ effectHeal = 0; effectHealTimer = 0; }
+    }
+    if(effectSpeedTimer > 0){
+        effectSpeedTimer -= dt;
+        if(effectSpeedTimer <= 0){ effectSpeed = 0; effectSpeedTimer = 0; }
     }
 
     pthread_mutex_unlock(&playerMutex);
@@ -5976,12 +7205,12 @@ void renderMenu(){
         menuText((resWidth-htw)/2.0f, cy+80, ht, GLUT_BITMAP_TIMES_ROMAN_24);
         menuDivider(cy+66);
 
-        // IP label + input box
+        // IP label + input box (wider for internet IPs)
         glColor3f(0.85f,0.85f,0.85f);
         menuText(LBL_X, cy+26, "Server IP:", GLUT_BITMAP_HELVETICA_18);
 
         float ibx=CTL_X, iby=cy+12;
-        float ibw=160, ibh=28;
+        float ibw=220, ibh=28;
         menuRect(ibx,iby,ibw,ibh,
             joinIPFocus?0.12f:0.08f, joinIPFocus?0.22f:0.12f, joinIPFocus?0.38f:0.22f, 0.96f);
         menuRectOutline(ibx,iby,ibw,ibh,
@@ -5996,39 +7225,36 @@ void renderMenu(){
             glEnd();
         }
 
-        // ── LAN Servers list ──────────────────────────────
-        float listY = cy - 10;
-        glColor3f(0.55f,0.78f,1.0f);
-        menuText(LBL_X, listY, "LAN Servers:", GLUT_BITMAP_HELVETICA_12);
-        listY -= 4;
+        // Instructions
+        glColor3f(0.55f,0.75f,1.0f);
+        menuText(LBL_X, cy-14, "Ask the host for their IP address.", GLUT_BITMAP_HELVETICA_12);
+        menuText(LBL_X, cy-30, "Works over internet and LAN.", GLUT_BITMAP_HELVETICA_12);
+        menuText(LBL_X, cy-46, "Port 5000 must be open on the host.", GLUT_BITMAP_HELVETICA_12);
 
+        // LAN servers (quick-fill convenience)
         pthread_mutex_lock(&lanMutex);
-        if(numLanServers == 0){
-            glColor3f(0.45f,0.45f,0.48f);
-            menuText(CTL_X, listY - 16, "Scanning...", GLUT_BITMAP_HELVETICA_12);
-        }
-        for(int li = 0; li < numLanServers; li++){
-            float rowY = listY - 20 - li*26;
-            bool sel = (li == selectedServer);
-            menuRect(CTL_X-2, rowY-2, 180, 22,
-                sel ? 0.15f:0.08f, sel ? 0.30f:0.12f, sel ? 0.55f:0.18f, 0.90f);
-            if(sel) menuRectOutline(CTL_X-2, rowY-2, 180, 22, 0.4f,0.7f,1.0f);
-            glColor3f(sel?1.0f:0.85f, sel?1.0f:0.85f, sel?1.0f:0.85f);
-            menuText(CTL_X+4, rowY+4, lanServers[li].ip, GLUT_BITMAP_HELVETICA_12);
+        if(numLanServers > 0){
+            glColor3f(0.55f,0.78f,1.0f);
+            menuText(LBL_X, cy-66, "LAN servers found:", GLUT_BITMAP_HELVETICA_12);
+            for(int li = 0; li < numLanServers; li++){
+                float rowY = cy - 86 - li*22;
+                bool sel = (li == selectedServer);
+                menuRect(CTL_X-2, rowY-2, 220, 20,
+                    sel?0.15f:0.08f, sel?0.30f:0.12f, sel?0.55f:0.18f, 0.90f);
+                if(sel) menuRectOutline(CTL_X-2, rowY-2, 220, 20, 0.4f,0.7f,1.0f);
+                glColor3f(sel?1.0f:0.85f, sel?1.0f:0.85f, 1.0f);
+                menuText(CTL_X+4, rowY+3, lanServers[li].ip, GLUT_BITMAP_HELVETICA_12);
+            }
         }
         pthread_mutex_unlock(&lanMutex);
 
-        // Error message
         if(joinFailed){
-            const char *err = "No server found. Check IP and try again.";
-            int ew=0; for(const char *c=err;*c;c++) ew+=glutBitmapWidth(GLUT_BITMAP_HELVETICA_12,*c);
             glColor3f(1.0f,0.25f,0.25f);
-            menuText((resWidth-ew)/2.0f, cy - 10 - (numLanServers?numLanServers*26+4:24) - 16,
-                     err, GLUT_BITMAP_HELVETICA_12);
+            menuText(LBL_X, cy-130, "Could not connect. Check IP and firewall.", GLUT_BITMAP_HELVETICA_12);
         }
 
-        menuButton(BTN_X, cy-130, "Connect", mx,my);
-        menuButton(BTN_X, cy-180, "Back",    mx,my);
+        menuButton(BTN_X, cy-160, "Connect", mx,my);
+        menuButton(BTN_X, cy-210, "Back",    mx,my);
 
     } else if(menuState==MENU_DEAD){
         // Semi-transparent dark red overlay
@@ -6088,7 +7314,7 @@ void handleMenuClick(int mx, int my_x11){
             resWidth=resOptions[resIndex][0]; resHeight=resOptions[resIndex][1];
             XResizeWindow(dpy,win,resWidth,resHeight);
             glViewport(0,0,resWidth,resHeight);
-            glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(60,(double)resWidth/resHeight,0.5,1200.0);
+            glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(70,(double)resWidth/resHeight,0.5,6000.0);
             glMatrixMode(GL_MODELVIEW);
         }
         if(inRect(mx,my, arrowRightX,row, SML_W,SML_H)){
@@ -6096,7 +7322,7 @@ void handleMenuClick(int mx, int my_x11){
             resWidth=resOptions[resIndex][0]; resHeight=resOptions[resIndex][1];
             XResizeWindow(dpy,win,resWidth,resHeight);
             glViewport(0,0,resWidth,resHeight);
-            glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(60,(double)resWidth/resHeight,0.5,1200.0);
+            glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(70,(double)resWidth/resHeight,0.5,6000.0);
             glMatrixMode(GL_MODELVIEW);
         }
         row -= rowG;
@@ -6114,14 +7340,13 @@ void handleMenuClick(int mx, int my_x11){
     } else if(menuState==MENU_JOIN){
         float cy  = resHeight/2.0f + 80;
         float ibx = CTL_X, iby = cy+12;
-        joinIPFocus = inRect(mx,my, ibx,iby, 160,28);
+        joinIPFocus = inRect(mx,my, ibx,iby, 220,28);
 
         // Click on a LAN server row — fill IP box and select
-        float listY = cy - 10;
         pthread_mutex_lock(&lanMutex);
         for(int li = 0; li < numLanServers; li++){
-            float rowY = listY - 20 - li*26;
-            if(inRect(mx,my, (int)(CTL_X-2),(int)(rowY-2), 180,22)){
+            float rowY = cy - 86 - li*22;
+            if(inRect(mx,my, (int)(CTL_X-2),(int)(rowY-2), 220,20)){
                 selectedServer = li;
                 strncpy(joinIP, lanServers[li].ip, sizeof(joinIP)-1);
                 joinIPLen = (int)strlen(joinIP);
@@ -6130,11 +7355,11 @@ void handleMenuClick(int mx, int my_x11){
         }
         pthread_mutex_unlock(&lanMutex);
 
-        if(inRect(mx,my, BTN_X,(int)(cy-130), BTN_W,BTN_H)){
+        if(inRect(mx,my, BTN_X,(int)(cy-160), BTN_W,BTN_H)){
             isServer=false; joinFailed=false; joinTimer=0.0f;
             menuState=MENU_PLAYING;
         }
-        if(inRect(mx,my, BTN_X,(int)(cy-180), BTN_W,BTN_H)) menuState=MENU_MAIN;
+        if(inRect(mx,my, BTN_X,(int)(cy-210), BTN_W,BTN_H)) menuState=MENU_MAIN;
 
     } else if(menuState==MENU_DEAD){
         if(inRect(mx,my, BTN_X,(int)(resHeight/2.0f-20), BTN_W,BTN_H)){
@@ -6153,14 +7378,30 @@ void handleInput(XEvent *e){
             resWidth=nw; resHeight=nh;
             glViewport(0,0,resWidth,resHeight);
             glMatrixMode(GL_PROJECTION); glLoadIdentity();
-            gluPerspective(60,(double)resWidth/resHeight,0.5,1200.0);
+            gluPerspective(70,(double)resWidth/resHeight,0.5,6000.0);
             glMatrixMode(GL_MODELVIEW);
         }
     }
-    // Track mouse position for hover effects (X11 y=0 at top, convert to GL coords)
+    // Mouse motion
     if(e->type==MotionNotify){
-        menuMouseX = e->xmotion.x;
-        menuMouseY = resHeight - e->xmotion.y;
+        int mx = e->xmotion.x, my = e->xmotion.y;
+        if(mouseCaptured && menuState==MENU_PLAYING){
+            int dx = mx - mouseWarpX;
+            int dy = my - mouseWarpY;
+            if(dx != 0 || dy != 0){
+                if(!inPlane){
+                    // Walker / store: yaw left-right, pitch not used
+                    if(inStoreIdx >= 0)
+                        storeWalkerYaw -= dx * mouseSensX;
+                    else
+                        walkerYaw      -= dx * mouseSensX;
+                }
+                XWarpPointer(dpy, None, win, 0,0,0,0, mouseWarpX, mouseWarpY);
+            }
+        } else {
+            menuMouseX = mx;
+            menuMouseY = resHeight - my;
+        }
     }
     if(e->type==ButtonPress && e->xbutton.button==Button1){
         if(menuState!=MENU_PLAYING){
@@ -6191,6 +7432,67 @@ void handleInput(XEvent *e){
             return;
         }
 
+        // Store ordering/consuming: digit 1-5 while inside a store
+        if(inStoreIdx >= 0 && inStoreIdx < numStores && menuState==MENU_PLAYING){
+            int orderIdx = -1;
+            if(k==XK_1) orderIdx=0; else if(k==XK_2) orderIdx=1;
+            else if(k==XK_3) orderIdx=2; else if(k==XK_4) orderIdx=3;
+            else if(k==XK_5) orderIdx=4;
+            if(orderIdx >= 0){
+                StoreType st2 = stores[inStoreIdx].type;
+                const MenuItem *menu2 = (st2==STORE_ALBERTSONS) ? menuAlbertsons
+                                       :(st2==STORE_ARBYS)       ? menuArbys
+                                                                  : menuLJS;
+                const MenuItem *item = &menu2[orderIdx];
+                if(inventory[orderIdx] > 0){
+                    // Consume item from inventory
+                    inventory[orderIdx]--;
+                    chatAddMsg(item->useMsg);
+                    // Apply effect
+                    if(item->effect == EFF_HEAL || item->effect == EFF_HEALSPD){
+                        effectHeal      = item->effectMag;
+                        effectHealTimer = item->effectDur;
+                    }
+                    if(item->effect == EFF_SPEED || item->effect == EFF_HEALSPD){
+                        effectSpeed      = item->effectMag;
+                        effectSpeedTimer = item->effectDur;
+                    }
+                } else {
+                    // Buy item — add to inventory
+                    inventory[orderIdx]++;
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "[Cashier] %s  (press %d again to eat/drink)",
+                             item->buyMsg, orderIdx+1);
+                    chatAddMsg(msg);
+                }
+            }
+            return;
+        }
+
+        // Consume inventory items outside stores too (press 1-5)
+        if(menuState==MENU_PLAYING && !chatOpen && inStoreIdx<0){
+            int orderIdx = -1;
+            if(k==XK_1) orderIdx=0; else if(k==XK_2) orderIdx=1;
+            else if(k==XK_3) orderIdx=2; else if(k==XK_4) orderIdx=3;
+            else if(k==XK_5) orderIdx=4;
+            if(orderIdx >= 0 && inventory[orderIdx] > 0){
+                const MenuItem *menu2 = (lastStoreType==STORE_ALBERTSONS) ? menuAlbertsons
+                                        :(lastStoreType==STORE_ARBYS)      ? menuArbys
+                                                                            : menuLJS;
+                const MenuItem *item = &menu2[orderIdx];
+                inventory[orderIdx]--;
+                chatAddMsg(item->useMsg);
+                if(item->effect == EFF_HEAL || item->effect == EFF_HEALSPD){
+                    effectHeal      = item->effectMag;
+                    effectHealTimer = item->effectDur;
+                }
+                if(item->effect == EFF_SPEED || item->effect == EFF_HEALSPD){
+                    effectSpeed      = item->effectMag;
+                    effectSpeedTimer = item->effectDur;
+                }
+            }
+        }
+
         // IP text input when in JOIN menu
         if(menuState==MENU_JOIN && joinIPFocus){
             if(k==XK_BackSpace){
@@ -6209,9 +7511,13 @@ void handleInput(XEvent *e){
         }
         if(k<65536) keys[k]=true;
         if(k==XK_Escape){
-            if(menuState==MENU_PLAYING) menuState=MENU_MAIN;
-            else if(menuState==MENU_DEAD){ menuState=MENU_MAIN; gameStarted=false; }
-            else running=false;
+            if(menuState==MENU_PLAYING){
+                menuState=MENU_MAIN;
+                if(mouseCaptured){ XUngrabPointer(dpy, CurrentTime); mouseCaptured=false; }
+            } else if(menuState==MENU_DEAD){
+                menuState=MENU_MAIN; gameStarted=false;
+                if(mouseCaptured){ XUngrabPointer(dpy, CurrentTime); mouseCaptured=false; }
+            } else running=false;
         }
         if(k==XK_t || k==XK_T){
             if(menuState==MENU_PLAYING && !chatOpen){
@@ -6288,6 +7594,20 @@ void gameLoop(){
                 pthread_mutex_unlock(&tornadoMutex);
             }
             glClearColor(0.5f,0.8f,1.0f,1.0f);
+            // Capture mouse and hide cursor
+            mouseWarpX = resWidth  / 2;
+            mouseWarpY = resHeight / 2;
+            XWarpPointer(dpy, None, win, 0,0,0,0, mouseWarpX, mouseWarpY);
+            // Create invisible cursor
+            static char cdata[1] = {0};
+            Pixmap cpix = XCreateBitmapFromData(dpy, win, cdata, 1, 1);
+            XColor ccol; ccol.pixel=0; ccol.red=0; ccol.green=0; ccol.blue=0; ccol.flags=0;
+            Cursor invisCursor = XCreatePixmapCursor(dpy, cpix, cpix, &ccol, &ccol, 0, 0);
+            XFreePixmap(dpy, cpix);
+            XGrabPointer(dpy, win, True,
+                         PointerMotionMask|ButtonPressMask|ButtonReleaseMask,
+                         GrabModeAsync, GrabModeAsync, win, invisCursor, CurrentTime);
+            mouseCaptured = true;
         }
 
         // Client join timeout — if seed not received after JOIN_TIMEOUT seconds, go back
@@ -6470,31 +7790,50 @@ static void updateLanServers(float dt){
     pthread_mutex_unlock(&lanMutex);
 }
 
-void initNetwork(const char* serverIp, int serverPort, int clientPort){
-    sockfd = socket(AF_INET, SOCK_DGRAM,0);
-    if(sockfd<0){ perror("socket"); exit(1);}
+void initNetwork(const char* serverIp, int serverPort){
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sockfd<0){ perror("socket"); exit(1); }
 
-    // Both sides bind to their own listen port
-    struct sockaddr_in bindAddr={0};
-    bindAddr.sin_family=AF_INET;
-    bindAddr.sin_addr.s_addr=INADDR_ANY;
-    bindAddr.sin_port = htons(isServer ? serverPort : clientPort);
+    // Both server and client bind the same port so NAT traversal works:
+    // client sends first (opens NAT hole), server replies to source addr it sees.
+    // SO_REUSEADDR lets restarts reuse the port immediately.
+    int reuse = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in bindAddr = {0};
+    bindAddr.sin_family      = AF_INET;
+    bindAddr.sin_addr.s_addr = INADDR_ANY;
+    bindAddr.sin_port        = htons(serverPort);
     if(bind(sockfd,(struct sockaddr*)&bindAddr,sizeof(bindAddr))<0){ perror("bind"); exit(1); }
     printf("[NET] %s bound to port %d | target server: %s:%d\n",
-        isServer ? "Server" : "Client",
-        isServer ? serverPort : clientPort,
-        serverIp, serverPort);
+        isServer ? "Server" : "Client", serverPort, serverIp, serverPort);
 
-    // Client pre-fills server address; server waits to learn client address on first MSG_CONNECT
+    // Client pre-fills server address; server waits to learn client address on first MSG_CONNECT.
     if(!isServer){
-        otherAddr.sin_family=AF_INET;
-        otherAddr.sin_port=htons(serverPort);
-        inet_pton(AF_INET,serverIp,&otherAddr.sin_addr);
+        otherAddr.sin_family = AF_INET;
+        otherAddr.sin_port   = htons(serverPort);
+        inet_pton(AF_INET, serverIp, &otherAddr.sin_addr);
     }
 
-    fcntl(sockfd,F_SETFL,O_NONBLOCK);
+    fcntl(sockfd, F_SETFL, O_NONBLOCK);
 
-    // Client will announce itself repeatedly in the network thread until seed is received
+    // Detect local IP via UDP connect trick (no packet sent)
+    {
+        int tmp = socket(AF_INET, SOCK_DGRAM, 0);
+        if(tmp >= 0){
+            struct sockaddr_in probe = {0};
+            probe.sin_family = AF_INET;
+            probe.sin_port   = htons(80);
+            inet_pton(AF_INET, "8.8.8.8", &probe.sin_addr);
+            if(connect(tmp,(struct sockaddr*)&probe,sizeof(probe))==0){
+                struct sockaddr_in me = {0}; socklen_t ml=sizeof(me);
+                if(getsockname(tmp,(struct sockaddr*)&me,&ml)==0)
+                    inet_ntop(AF_INET,&me.sin_addr,localIP,sizeof(localIP));
+            }
+            close(tmp);
+        }
+        printf("[NET] Local IP: %s\n", localIP);
+    }
 }
 
 // -------- Start Game (called once menu selection is made) --------
@@ -6535,9 +7874,11 @@ void startGame(){
     initWeather();
     initClouds();
     initTrees();
+    initStores();
+    initSuburbs();
     voiceInit();
     voiceStart();
-    initNetwork(joinIP, 5000, 5001);
+    initNetwork(joinIP, 5000);
 
     if(pthread_create(&netThread,NULL,networkThreadFunc,NULL)!=0){ perror("pthread_create"); exit(1); }
     pthread_t stdinThread; pthread_create(&stdinThread, NULL, stdinThreadFunc, NULL);
@@ -6551,7 +7892,7 @@ int main(){
 
     // Viewport & projection (use initial resWidth/resHeight)
     glViewport(0,0,resWidth,resHeight);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(60,(double)resWidth/resHeight,0.5,1200.0);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(70,(double)resWidth/resHeight,0.5,6000.0);
     glMatrixMode(GL_MODELVIEW);
 
     startLanListener(); // background thread listens for LAN server announcements
